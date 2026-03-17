@@ -25,6 +25,20 @@ if ("home_team" %in% names(matches_all) && !"local_team" %in% names(matches_all)
   matches_all <- matches_all %>% rename(local_team = home_team)
 }
 
+# Índex de categories i grups disponibles
+categories_disponibles <- sort(unique(all_matches_events_all$categoria))
+
+# Label visual per categoria (TERCERA → "Tercera Catalana", etc.)
+categoria_label <- function(cat) {
+  switch(cat,
+         "TERCERA"  = "Tercera Catalana",
+         "SEGONA"   = "Segona Catalana",
+         "PRIMERA"  = "Primera Catalana",
+         cat   # fallback: el valor tal qual
+  )
+}
+cat_choices <- setNames(categories_disponibles, sapply(categories_disponibles, categoria_label))
+
 grups_disponibles <- sort(unique(all_matches_events_all$grup))
 
 # ============================================================================
@@ -38,14 +52,16 @@ calculate_player_impact <- function(player_match_data, team_match_data) {
       goals_for == goals_against ~ 1,
       TRUE ~ 0
     ))
+  # Usar jornada com a clau de join (evita problemes amb match_id inconsistents entre datasets)
   all_team_matches <- team_match_w %>%
-    dplyr::select(team, match_id, jornada, team_points) %>% distinct()
-  all_players_teams <- player_match_data %>% dplyr::select(player, team) %>% distinct()
+    select(team, jornada, team_points) %>% distinct()
+  all_players_teams <- player_match_data %>% select(player, team) %>% distinct()
   player_all_matches <- all_players_teams %>%
     left_join(all_team_matches, by = "team", relationship = "many-to-many")
-  player_participation <- player_match_data %>% dplyr::select(player, team, match_id, minutes_played)
+  player_participation <- player_match_data %>% select(player, team, jornada, minutes_played) %>%
+    group_by(player, team, jornada) %>% summarise(minutes_played = sum(minutes_played, na.rm=TRUE), .groups="drop")
   player_complete_record <- player_all_matches %>%
-    left_join(player_participation, by = c("player", "team", "match_id")) %>%
+    left_join(player_participation, by = c("player", "team", "jornada")) %>%
     mutate(minutes_played = replace_na(minutes_played, 0), played = minutes_played > 0)
   points_when_playing <- player_complete_record %>%
     filter(played) %>%
@@ -65,11 +81,12 @@ calculate_player_impact <- function(player_match_data, team_match_data) {
                         avg_points_when_playing - avg_points_when_not_playing,
                         NA_real_)
     ) %>%
-    dplyr::select(player, team, avg_points_when_playing, avg_points_when_not_playing,
+    select(player, team, avg_points_when_playing, avg_points_when_not_playing,
            impacte, games_played, games_not_played)
 }
 
 calculate_player_ratings <- function(player_match_data, player_impact_data) {
+  if(nrow(player_match_data) == 0) return(data.frame(player=character(),team=character(),total_minutes=numeric(),goals_per_90=numeric(),impacte=numeric(),rating_global=numeric()))
   player_agg <- player_match_data %>%
     group_by(player, team) %>%
     summarise(
@@ -83,48 +100,66 @@ calculate_player_ratings <- function(player_match_data, player_impact_data) {
       goals_per_90   = ifelse(total_minutes > 0, (total_goals  / total_minutes) * 90, 0),
       yellows_per_90 = ifelse(total_minutes > 0, (total_yellows/ total_minutes) * 90, 0)
     ) %>%
-    left_join(player_impact_data %>% dplyr::select(player, team, impacte, games_not_played),
+    left_join(player_impact_data %>% select(player, team, impacte, games_not_played),
               by = c("player", "team")) %>%
     mutate(impacte = replace_na(impacte, 0)) %>%
     mutate(
-      rating_off_raw    = 0.35 * goals_per_90 + 0.4 * pmax(-1, pmin(2, impacte)) +
-        0.25 * (total_minutes / 900),
+      rating_off_raw    = 0.4 * goals_per_90 + 0.4 * pmax(-1, pmin(2, impacte)) +
+        0.2 * (total_minutes / 900),
       rating_off        = (rating_off_raw - mean(rating_off_raw, na.rm = TRUE)) /
         (sd(rating_off_raw, na.rm = TRUE) + 0.01) * 0.3 + 1,
       rating_def_raw    = 1 - 0.15 * yellows_per_90 + 0.1 * pmax(0, impacte),
       rating_def        = pmax(0.5, pmin(1.5, rating_def_raw)),
       rating_global_raw = 0.65 * rating_off + 0.35 * rating_def,
-      rating_global     = (rating_global_raw - min(rating_global_raw, na.rm = TRUE)) /
-        (max(rating_global_raw, na.rm = TRUE) - min(rating_global_raw, na.rm = TRUE)) * 100,
-      rating_global     = round(rating_global, 0)
+      rating_global     = {
+        rng_min <- min(rating_global_raw, na.rm = TRUE)
+        rng_max <- max(rating_global_raw, na.rm = TRUE)
+        if(is.finite(rng_min) && is.finite(rng_max) && rng_max > rng_min)
+          round((rating_global_raw - rng_min) / (rng_max - rng_min) * 100, 0)
+        else
+          rep(50L, length(rating_global_raw))
+      }
     )
-  player_agg %>% dplyr::select(player, team, total_minutes, goals_per_90, impacte, rating_global)
+  player_agg %>% select(player, team, total_minutes, goals_per_90, impacte, rating_global)
 }
 
 estimate_team_latents <- function(team_match_data) {
-  global_avg_goals <- mean(c(team_match_data$goals_for, team_match_data$goals_against))
-  team_match_data %>%
+  if(nrow(team_match_data)==0) return(data.frame(team=character(),n_matches=integer(),attack=numeric(),defense=numeric(),avg_goals_for=numeric(),avg_goals_against=numeric(),rating=numeric()))
+  global_avg_goals <- mean(c(team_match_data$goals_for, team_match_data$goals_against), na.rm=TRUE)
+  res <- team_match_data %>%
     group_by(team) %>%
-    summarise(n_matches = n(), avg_goals_for = mean(goals_for),
-              avg_goals_against = mean(goals_against), .groups = "drop") %>%
+    summarise(n_matches = n(), avg_goals_for = mean(goals_for, na.rm=TRUE),
+              avg_goals_against = mean(goals_against, na.rm=TRUE), .groups = "drop") %>%
     mutate(
       shrinkage = n_matches / (n_matches + 5),
       attack    = (log(avg_goals_for     + 0.1) - log(global_avg_goals + 0.1)) * shrinkage,
       defense   = -(log(avg_goals_against + 0.1) - log(global_avg_goals + 0.1)) * shrinkage,
-      raw_score = (attack + defense) / 2,
-      rating    = round((raw_score - min(raw_score)) / (max(raw_score) - min(raw_score)) * 100, 0)
-    ) %>%
-    dplyr::select(team, n_matches, attack, defense, avg_goals_for, avg_goals_against, rating)
+      raw_score = (attack + defense) / 2
+    )
+  rng_min <- min(res$raw_score, na.rm=TRUE); rng_max <- max(res$raw_score, na.rm=TRUE)
+  res %>% mutate(
+    rating = if(is.finite(rng_min) && is.finite(rng_max) && rng_max > rng_min)
+      round((raw_score - rng_min) / (rng_max - rng_min) * 100, 0)
+    else rep(50L, n())
+  ) %>%
+    select(team, n_matches, attack, defense, avg_goals_for, avg_goals_against, rating)
 }
 
 calculate_team_radar <- function(team_match_data, all_events_data) {
-  global_avg_goals <- mean(c(team_match_data$goals_for, team_match_data$goals_against))
+  if(nrow(team_match_data)==0) return(data.frame(team=character(),radar_attack=numeric(),radar_defense=numeric(),radar_home=numeric(),radar_away=numeric(),radar_fairplay=numeric(),radar_first=numeric(),radar_second=numeric()))
+  scale_0100 <- function(x) {
+    x[!is.finite(x)] <- NA
+    rng <- range(x, na.rm = TRUE)
+    if (!all(is.finite(rng)) || diff(rng) == 0) return(rep(50, length(x)))
+    round((x - rng[1]) / (rng[2] - rng[1]) * 100, 1)
+  }
+  global_avg_goals <- mean(c(team_match_data$goals_for, team_match_data$goals_against), na.rm=TRUE)
   radar_raw <- team_match_data %>%
     group_by(team) %>%
     summarise(
       n_matches       = n(),
-      avg_gf          = mean(goals_for),
-      avg_ga          = mean(goals_against),
+      avg_gf          = mean(goals_for, na.rm=TRUE),
+      avg_ga          = mean(goals_against, na.rm=TRUE),
       avg_pts_home    = mean(team_points[home_away == "Home"], na.rm = TRUE),
       avg_pts_away    = mean(team_points[home_away == "Away"], na.rm = TRUE),
       cards_per_match = mean(yellow_cards + red_cards * 3, na.rm = TRUE),
@@ -148,11 +183,6 @@ calculate_team_radar <- function(team_match_data, all_events_data) {
       goals_first  = replace_na(goals_first,  0) / n_matches,
       goals_second = replace_na(goals_second, 0) / n_matches
     )
-  scale_0100 <- function(x) {
-    rng <- range(x, na.rm = TRUE)
-    if (diff(rng) == 0) return(rep(50, length(x)))
-    round((x - rng[1]) / (rng[2] - rng[1]) * 100, 1)
-  }
   radar_raw %>%
     mutate(
       radar_attack   = scale_0100(attack),
@@ -163,14 +193,15 @@ calculate_team_radar <- function(team_match_data, all_events_data) {
       radar_first    = scale_0100(goals_first),
       radar_second   = scale_0100(goals_second)
     ) %>%
-    dplyr::select(team, radar_attack, radar_defense, radar_home,
+    select(team, radar_attack, radar_defense, radar_home,
            radar_away, radar_fairplay, radar_first, radar_second)
 }
 
 calculate_player_radar <- function(player_match_data, player_impact_data, player_stats_data) {
   scale_0100 <- function(x) {
+    x[!is.finite(x)] <- NA
     rng <- range(x, na.rm = TRUE)
-    if (diff(rng) == 0) return(rep(50, length(x)))
+    if (!all(is.finite(rng)) || diff(rng) == 0) return(rep(50, length(x)))
     round(pmax(0, pmin(100, (x - rng[1]) / (rng[2] - rng[1]) * 100)), 1)
   }
   base <- player_match_data %>%
@@ -190,7 +221,7 @@ calculate_player_radar <- function(player_match_data, player_impact_data, player
       availability   = starts / pmax(matches_played, 1),
       participation  = total_minutes / pmax(matches_played * 90, 1)
     ) %>%
-    left_join(player_impact_data %>% dplyr::select(player, team, impacte), by = c("player","team")) %>%
+    left_join(player_impact_data %>% select(player, team, impacte), by = c("player","team")) %>%
     mutate(impacte = replace_na(impacte, 0))
   base %>%
     mutate(
@@ -200,12 +231,12 @@ calculate_player_radar <- function(player_match_data, player_impact_data, player
       radar_minuts      = scale_0100(participation),
       radar_fairplay    = scale_0100(-yellows_per_90 - 3 * (total_reds / pmax(total_minutes / 90, 1)))
     ) %>%
-    dplyr::select(player, team, radar_gol, radar_impacte, radar_titularitat, radar_minuts, radar_fairplay)
+    select(player, team, radar_gol, radar_impacte, radar_titularitat, radar_minuts, radar_fairplay)
 }
 
 calculate_tilt <- function(team_match_data, team_ratings_data, n_recent = 5) {
   draw_param    <- 20 / 3
-  rating_lookup <- team_ratings_data %>% dplyr::select(team, rating)
+  rating_lookup <- team_ratings_data %>% select(team, rating)
   tilt_vals <- team_match_data %>%
     left_join(rating_lookup, by = "team") %>%
     left_join(rating_lookup %>% rename(rating_opp = rating, opponent = team), by = "opponent") %>%
@@ -240,20 +271,21 @@ calculate_tilt <- function(team_match_data, team_ratings_data, n_recent = 5) {
 # ============================================================================
 ui <- dashboardPage(
   skin = "blue",
-  title = "Futbol Tercera Catalana",
+  title = "Futbol Català",
   
   dashboardHeader(
-    title = "Tercera Catalana",
-    # Selector de grup a la capçalera
+    title = "Futbol Català",
+    # Selector de categoria + grup a la capçalera
     tags$li(class = "dropdown",
             style = "padding: 8px 10px;",
-            div(style = "display:flex; align-items:center; gap:8px;",
-                tags$span(style = "color:white; font-weight:bold; font-size:14px;", "Grup:"),
-                selectInput("grup_select", label = NULL,
-                            choices = setNames(grups_disponibles,
-                                               paste0("Grup ", grups_disponibles)),
-                            selected = grups_disponibles[1],
-                            width = "120px")
+            div(style = "display:flex; align-items:center; gap:10px;",
+                tags$span(style = "color:white; font-weight:bold; font-size:13px;", "Categoria:"),
+                selectInput("cat_select", label = NULL,
+                            choices  = cat_choices,
+                            selected = categories_disponibles[1],
+                            width    = "170px"),
+                tags$span(style = "color:white; font-weight:bold; font-size:13px;", "Grup:"),
+                uiOutput("grup_select_ui")
             )
     )
   ),
@@ -265,7 +297,8 @@ ui <- dashboardPage(
                 menuItem("Classificació", tabName = "classificacio", icon = icon("trophy")),
                 menuItem("Equips",        tabName = "equips",        icon = icon("users")),
                 menuItem("Jugadors",      tabName = "jugadors",      icon = icon("user")),
-                menuItem("Estadístiques", tabName = "stats",         icon = icon("chart-bar"))
+                menuItem("Estadístiques", tabName = "stats",         icon = icon("chart-bar")),
+                menuItem("Simulador",     tabName = "simulador",     icon = icon("flask"))
     )
   ),
   
@@ -277,7 +310,7 @@ ui <- dashboardPage(
                 content = "Resultats, classificació i estadístiques avançades de la Tercera Catalana.")
     ),
     tags$head(tags$style(HTML("
-      /* Selector de grup a la capçalera */
+      /* Selectors de categoria i grup a la capçalera */
       .main-header .navbar .dropdown { padding-top: 0 !important; }
       .main-header .navbar .dropdown select {
         height: 34px; border-radius: 4px; border: none;
@@ -286,6 +319,14 @@ ui <- dashboardPage(
         cursor: pointer;
       }
       .main-header .navbar .dropdown select option { color: #333; background: white; }
+      /* El grup_select_ui és un renderUI — assegurem estil consistent */
+      .main-header .navbar .dropdown .shiny-input-container { margin: 0; }
+      .main-header .navbar .dropdown .shiny-input-container select {
+        height: 34px; border-radius: 4px; border: none;
+        background: rgba(255,255,255,0.15); color: white;
+        font-weight: bold; font-size: 13px; padding: 0 6px;
+        cursor: pointer;
+      }
       .content-wrapper { background-color: #f4f6f9; }
       .small-box .inner h3 { font-size: 28px; }
       .acta-box { background: white; border-radius: 8px; padding: 15px;
@@ -325,6 +366,39 @@ ui <- dashboardPage(
                                        vertical-align:middle; }
       .ultims-partits table tbody tr:last-child td { border-bottom:none; }
       .evt-icon { font-size:13px; margin-right:2px; }
+      /* === SIMULADOR === */
+      .sim-scoreboard { background:linear-gradient(135deg,#1a3a6b,#2980b9); color:white;
+                        border-radius:16px; padding:24px 20px; text-align:center;
+                        box-shadow:0 6px 20px rgba(0,0,0,.25); margin-bottom:16px; }
+      .sim-scoreboard .sim-teams { font-size:17px; font-weight:700; letter-spacing:.5px;
+                                    opacity:.9; margin-bottom:8px; }
+      .sim-scoreboard .sim-score { font-size:72px; font-weight:900; line-height:1;
+                                   letter-spacing:8px; }
+      .sim-scoreboard .sim-status { font-size:12px; opacity:.75; margin-top:6px;
+                                     letter-spacing:2px; text-transform:uppercase; }
+      .sim-event { display:flex; align-items:center; gap:10px; padding:7px 12px;
+                   border-radius:8px; margin-bottom:5px; font-size:13px; }
+      .sim-event.gol-h  { background:#d5f5e3; border-left:4px solid #27ae60; }
+      .sim-event.gol-a  { background:#fadbd8; border-left:4px solid #e74c3c; }
+      .sim-event.groga  { background:#fef9e7; border-left:4px solid #f39c12; }
+      .sim-event.vermella { background:#fadbd8; border-left:4px solid #c0392b; }
+      .sim-event.canvi  { background:#eaf4fb; border-left:4px solid #2980b9; }
+      .sim-event .sim-min { font-weight:900; color:#555; min-width:36px; }
+      .sim-prob-bar { height:32px; border-radius:6px; display:flex;
+                      overflow:hidden; margin:8px 0; font-weight:bold; font-size:13px; }
+      .sim-prob-h { background:#27ae60; display:flex; align-items:center;
+                    justify-content:center; color:white; transition:width .5s; }
+      .sim-prob-d { background:#f39c12; display:flex; align-items:center;
+                    justify-content:center; color:white; transition:width .5s; }
+      .sim-prob-a { background:#e74c3c; display:flex; align-items:center;
+                    justify-content:center; color:white; transition:width .5s; }
+      .sim-lineup-col { background:white; border-radius:8px; padding:10px 14px;
+                        box-shadow:0 1px 4px rgba(0,0,0,.1); height:100%; }
+      .sim-lineup-col h6 { font-size:11px; font-weight:700; color:#555;
+                            text-transform:uppercase; letter-spacing:1px; margin-bottom:8px; }
+      .sim-lineup-player { font-size:12px; padding:3px 0; border-bottom:1px solid #f5f5f5;
+                            display:flex; justify-content:space-between; }
+      .sim-lineup-player:last-child { border-bottom:none; }
     ")),
               tags$script(HTML("
       Shiny.addCustomMessageHandler('evalJS', function(msg) { eval(msg); });
@@ -709,10 +783,262 @@ ui <- dashboardPage(
                               )
                      )
               )
+      ),
+      
+      # ====================================================================
+      # TAB 7: SIMULADOR
+      # ====================================================================
+      tabItem(tabName = "simulador",
+              h2("🔬 Simulador de Partits"),
+              p(style="color:#666; font-size:13px; margin-bottom:16px;",
+                "Simulació basada en un procés puntual Hawkes amb latents d'atac/defensa i player ratings. ",
+                "Selecciona dos equips i el mode de simulació."),
+              fluidRow(
+                column(12,
+                       box(width=12, title="⚙️ Configuració", solidHeader=TRUE, status="primary",
+                           fluidRow(
+                             column(3, uiOutput("sim_equip_home_ui")),
+                             column(3, uiOutput("sim_equip_away_ui")),
+                             column(3,
+                                    sliderInput("sim_n_sims", "Simulacions Monte Carlo:",
+                                                min=50, max=2000, value=500, step=50)
+                             ),
+                             column(3,
+                                    br(),
+                                    actionButton("sim_run_single", "⚡ Simular 1 Partit",
+                                                 class="btn btn-warning btn-block",
+                                                 style="font-weight:bold; font-size:14px; margin-bottom:8px;"),
+                                    actionButton("sim_run", "🔄 Monte Carlo",
+                                                 class="btn btn-success btn-block",
+                                                 style="font-weight:bold; font-size:14px;")
+                             )
+                           ),
+                           uiOutput("sim_running_msg")
+                       )
+                )
+              ),
+              # Resultats dinàmics: es mostren només quan hi ha dades
+              uiOutput("sim_results_panel")
       )
     )
   )
 )
+
+
+# ============================================================================
+# FUNCIONS DEL SIMULADOR HAWKES
+# ============================================================================
+
+sim_params <- list(
+  mu_g              = -4.55,           # era -4.8 → +0.25 (≈+28% intensitat base gols)
+  beta_pr           = 0.25,
+  beta_score_trailing = 0.15,
+  beta_score_leading  = -0.2,
+  beta_fatigue      = -0.3,
+  beta_home         = 0.12,
+  mu_yellow         = -4.2,           # era -4.5 → +0.3 (més targetes grogues)
+  beta_yellow_score = 0.08,
+  beta_yellow_fatigue = 0.18,         # era 0.15 → lleugerament més al final
+  mu_red            = -7.0,
+  beta_red_yellows  = 0.4,
+  alpha_gg          = 0.08,
+  alpha_gy          = 0.05,
+  alpha_yy          = 0.05,
+  kappa             = 0.3,
+  dt                = 1
+)
+
+agg_player_rating_fn <- function(onfield_ids, pr_df) {
+  if (length(onfield_ids) == 0) return(1.0)
+  r <- pr_df %>% filter(as.character(player) %in% as.character(onfield_ids)) %>% pull(rating_global)
+  if (length(r) == 0 || all(is.na(r))) return(1.0)
+  v <- mean(r, na.rm = TRUE)
+  if (is.na(v) || is.nan(v)) return(1.0)
+  return(v)
+}
+
+calc_fatigue_fn <- function(minutes_vec, current_minute) {
+  if (current_minute < 60) return(0)
+  avg_m <- mean(minutes_vec, na.rm = TRUE)
+  if (is.na(avg_m)) return(0)
+  fatigue <- (avg_m / 90) * ((current_minute - 60) / 30)
+  return(pmin(fatigue, 1.5))
+}
+
+calc_hawkes_fn <- function(current_time, past_events, alpha, kappa) {
+  if (length(past_events) == 0) return(0)
+  recent <- past_events[past_events > (current_time - 20)]
+  if (length(recent) == 0) return(0)
+  v <- sum(alpha * exp(-kappa * (current_time - recent)))
+  if (is.na(v) || is.nan(v)) return(0)
+  return(v)
+}
+
+safe_p <- function(x) pmax(0, pmin(1, ifelse(is.na(x)|is.nan(x), 0, x)))
+
+simulate_one_match <- function(home_team, away_team, lat_df, pr_df,
+                               home_lineup, away_lineup, params,
+                               verbose = FALSE) {
+  lat_h <- lat_df %>% filter(team == home_team)
+  lat_a <- lat_df %>% filter(team == away_team)
+  if (nrow(lat_h) == 0 | nrow(lat_a) == 0) return(NULL)
+  
+  A_h <- lat_h$attack[1];  D_h <- lat_h$defense[1]
+  A_a <- lat_a$attack[1];  D_a <- lat_a$defense[1]
+  
+  st <- list(
+    score_h = 0L, score_a = 0L,
+    on_h = home_lineup, on_a = away_lineup,
+    min_h = rep(0, length(home_lineup)),
+    min_a = rep(0, length(away_lineup)),
+    yel_h = rep(0L, length(home_lineup)),
+    yel_a = rep(0L, length(away_lineup)),
+    ev_gh = numeric(), ev_ga = numeric(),
+    ev_yh = numeric(), ev_ya = numeric(),
+    ev_rh = numeric(), ev_ra = numeric()
+  )
+  
+  all_h <- pr_df %>% filter(team == home_team, total_minutes >= 90) %>%
+    arrange(desc(rating_global)) %>% pull(player) %>% as.character()
+  all_a <- pr_df %>% filter(team == away_team, total_minutes >= 90) %>%
+    arrange(desc(rating_global)) %>% pull(player) %>% as.character()
+  bench_h <- setdiff(all_h, st$on_h); bench_a <- setdiff(all_a, st$on_a)
+  subs_h <- 0L; subs_a <- 0L; max_subs <- 3L
+  
+  event_log <- list()
+  
+  for (t in seq(1, 90, by = params$dt)) {
+    st$min_h <- st$min_h + params$dt
+    st$min_a <- st$min_a + params$dt
+    
+    # --- substitucions ---
+    if (t %in% c(60, 70, 80)) {
+      # local
+      if (subs_h < max_subs && length(bench_h) > 0 && length(st$on_h) == 11) {
+        rat_h <- sapply(st$on_h, function(p) { r <- pr_df %>% filter(as.character(player)==p) %>% pull(rating_global); if(length(r)==0) 1.0 else r[1] })
+        sub_pri <- st$min_h/90 - rat_h
+        diff_h <- st$score_a - st$score_h
+        do_sub <- (diff_h > 0 && t >= 60 && runif(1) < 0.78) ||
+          (diff_h < 0 && t >= 70 && runif(1) < 0.58) ||
+          (max(st$min_h) >= 80 && t >= 75 && runif(1) < 0.68)
+        if (do_sub) {
+          oi <- which.max(sub_pri); op <- st$on_h[oi]; ip <- bench_h[1]
+          st$on_h[oi] <- ip; st$min_h[oi] <- 0
+          bench_h <- c(setdiff(bench_h, ip), op)
+          subs_h <- subs_h + 1L
+          event_log <- append(event_log, list(list(minute=t, type="canvi_h", team=home_team, out=op, inn=ip)))
+        }
+      }
+      # visitant
+      if (subs_a < max_subs && length(bench_a) > 0 && length(st$on_a) == 11) {
+        rat_a <- sapply(st$on_a, function(p) { r <- pr_df %>% filter(as.character(player)==p) %>% pull(rating_global); if(length(r)==0) 1.0 else r[1] })
+        sub_pri_a <- st$min_a/90 - rat_a
+        diff_a <- st$score_h - st$score_a
+        do_sub_a <- (diff_a > 0 && t >= 60 && runif(1) < 0.78) ||
+          (diff_a < 0 && t >= 70 && runif(1) < 0.58) ||
+          (max(st$min_a) >= 80 && t >= 75 && runif(1) < 0.68)
+        if (do_sub_a) {
+          oi <- which.max(sub_pri_a); op <- st$on_a[oi]; ip <- bench_a[1]
+          st$on_a[oi] <- ip; st$min_a[oi] <- 0
+          bench_a <- c(setdiff(bench_a, ip), op)
+          subs_a <- subs_a + 1L
+          event_log <- append(event_log, list(list(minute=t, type="canvi_a", team=away_team, out=op, inn=ip)))
+        }
+      }
+    }
+    
+    # --- intensitats ---
+    PR_h <- agg_player_rating_fn(st$on_h, pr_df)
+    PR_a <- agg_player_rating_fn(st$on_a, pr_df)
+    sd_h <- st$score_a - st$score_h; sd_a <- st$score_h - st$score_a
+    fat_h <- calc_fatigue_fn(st$min_h, t); fat_a <- calc_fatigue_fn(st$min_a, t)
+    
+    eta_gh <- params$mu_g + A_h - D_a + params$beta_pr*(PR_h-1) + params$beta_home +
+      params$beta_score_trailing*max(0,sd_h) + params$beta_score_leading*max(0,-sd_h) -
+      params$beta_fatigue*fat_h
+    eta_ga <- params$mu_g + A_a - D_h + params$beta_pr*(PR_a-1) +
+      params$beta_score_trailing*max(0,sd_a) + params$beta_score_leading*max(0,-sd_a) -
+      params$beta_fatigue*fat_a
+    
+    lam_gh <- exp(eta_gh) + calc_hawkes_fn(t, st$ev_gh, params$alpha_gg, params$kappa)
+    lam_ga <- exp(eta_ga) + calc_hawkes_fn(t, st$ev_ga, params$alpha_gg, params$kappa)
+    
+    eta_yh <- params$mu_yellow + params$beta_yellow_score*max(0,sd_h) + params$beta_yellow_fatigue*fat_h
+    eta_ya <- params$mu_yellow + params$beta_yellow_score*max(0,sd_a) + params$beta_yellow_fatigue*fat_a
+    lam_yh <- exp(eta_yh) + calc_hawkes_fn(t, st$ev_yh, params$alpha_yy, params$kappa)
+    lam_ya <- exp(eta_ya) + calc_hawkes_fn(t, st$ev_ya, params$alpha_yy, params$kappa)
+    
+    tot_yh <- sum(st$yel_h > 0); tot_ya <- sum(st$yel_a > 0)
+    lam_rh <- exp(params$mu_red) * (1 + params$beta_red_yellows * tot_yh)
+    lam_ra <- exp(params$mu_red) * (1 + params$beta_red_yellows * tot_ya)
+    
+    p_gh <- safe_p(1 - exp(-lam_gh*params$dt))
+    p_ga <- safe_p(1 - exp(-lam_ga*params$dt))
+    p_yh <- safe_p(1 - exp(-lam_yh*params$dt))
+    p_ya <- safe_p(1 - exp(-lam_ya*params$dt))
+    p_rh <- safe_p(1 - exp(-lam_rh*params$dt))
+    p_ra <- safe_p(1 - exp(-lam_ra*params$dt))
+    
+    # --- gol local ---
+    if (runif(1) < p_gh && length(st$on_h) > 0) {
+      w <- sapply(st$on_h, function(p) { r <- pr_df%>%filter(as.character(player)==p)%>%pull(rating_global); if(length(r)==0||is.na(r[1])) 1 else r[1] })
+      w <- pmax(w, 0.01)
+      si <- sample(length(st$on_h), 1, prob=w)
+      sc <- st$on_h[si]
+      st$score_h <- st$score_h + 1L
+      st$ev_gh <- c(st$ev_gh, t)
+      event_log <- append(event_log, list(list(minute=t, type="gol_h", team=home_team, player=sc, score=paste0(st$score_h,"-",st$score_a))))
+    }
+    # --- gol visitant ---
+    if (runif(1) < p_ga && length(st$on_a) > 0) {
+      w <- sapply(st$on_a, function(p) { r <- pr_df%>%filter(as.character(player)==p)%>%pull(rating_global); if(length(r)==0||is.na(r[1])) 1 else r[1] })
+      w <- pmax(w, 0.01)
+      si <- sample(length(st$on_a), 1, prob=w)
+      sc <- st$on_a[si]
+      st$score_a <- st$score_a + 1L
+      st$ev_ga <- c(st$ev_ga, t)
+      event_log <- append(event_log, list(list(minute=t, type="gol_a", team=away_team, player=sc, score=paste0(st$score_h,"-",st$score_a))))
+    }
+    # --- groga local ---
+    if (runif(1) < p_yh && length(st$on_h) > 0) {
+      pi <- sample(length(st$on_h), 1); pn <- st$on_h[pi]
+      st$yel_h[pi] <- st$yel_h[pi] + 1L; st$ev_yh <- c(st$ev_yh, t)
+      if (st$yel_h[pi] >= 2L) {
+        st$on_h <- st$on_h[-pi]; st$min_h <- st$min_h[-pi]; st$yel_h <- st$yel_h[-pi]
+        st$ev_rh <- c(st$ev_rh, t)
+        event_log <- append(event_log, list(list(minute=t, type="vermella_h", team=home_team, player=pn)))
+      } else {
+        event_log <- append(event_log, list(list(minute=t, type="groga_h", team=home_team, player=pn)))
+      }
+    }
+    # --- groga visitant ---
+    if (runif(1) < p_ya && length(st$on_a) > 0) {
+      pi <- sample(length(st$on_a), 1); pn <- st$on_a[pi]
+      st$yel_a[pi] <- st$yel_a[pi] + 1L; st$ev_ya <- c(st$ev_ya, t)
+      if (st$yel_a[pi] >= 2L) {
+        st$on_a <- st$on_a[-pi]; st$min_a <- st$min_a[-pi]; st$yel_a <- st$yel_a[-pi]
+        st$ev_ra <- c(st$ev_ra, t)
+        event_log <- append(event_log, list(list(minute=t, type="vermella_a", team=away_team, player=pn)))
+      } else {
+        event_log <- append(event_log, list(list(minute=t, type="groga_a", team=away_team, player=pn)))
+      }
+    }
+  }
+  
+  list(
+    score_h = st$score_h, score_a = st$score_a,
+    result = case_when(st$score_h > st$score_a ~ "H", st$score_h < st$score_a ~ "A", TRUE ~ "D"),
+    n_goals_h = length(st$ev_gh), n_goals_a = length(st$ev_ga),
+    n_yellows_h = length(st$ev_yh), n_yellows_a = length(st$ev_ya),
+    n_reds_h = length(st$ev_rh), n_reds_a = length(st$ev_ra),
+    events = event_log
+  )
+}
+
+get_lineup_fn <- function(team_name, pr_df, n = 11) {
+  pr_df %>% filter(team == team_name, total_minutes >= 90) %>%
+    arrange(desc(total_minutes)) %>% head(n) %>% pull(player) %>% as.character()
+}
 
 # ============================================================================
 # SERVER
@@ -720,21 +1046,36 @@ ui <- dashboardPage(
 server <- function(input, output, session) {
   
   # ==========================================================================
-  # DADES REACTIVES FILTRADES PER GRUP
+  # SELECTOR DE GRUP DINÀMIC (depèn de la categoria seleccionada)
   # ==========================================================================
-  g <- reactive({ as.numeric(input$grup_select) })
+  output$grup_select_ui <- renderUI({
+    req(input$cat_select)
+    grups_cat <- sort(unique(
+      all_matches_events_all$grup[all_matches_events_all$categoria == input$cat_select]
+    ))
+    selectInput("grup_select", label = NULL,
+                choices  = setNames(grups_cat, paste0("Grup ", grups_cat)),
+                selected = grups_cat[1],
+                width    = "110px")
+  })
   
-  all_matches_events <- reactive({ all_matches_events_all %>% filter(grup == g()) })
-  all_matches_lineups<- reactive({ all_matches_lineups_all %>% filter(grup == g()) })
-  all_matches_info   <- reactive({ all_matches_info_all   %>% filter(grup == g()) })
-  player_match_stats <- reactive({ player_match_stats_all %>% filter(grup == g()) })
-  player_stats       <- reactive({ player_stats_all       %>% filter(grup == g()) })
-  standings_by_round <- reactive({ standings_by_round_all %>% filter(grup == g()) })
-  matches            <- reactive({ matches_all            %>% filter(grup == g()) })
+  # ==========================================================================
+  # DADES REACTIVES FILTRADES PER CATEGORIA + GRUP
+  # ==========================================================================
+  cat_sel <- reactive({ req(input$cat_select); input$cat_select })
+  g       <- reactive({ req(input$grup_select); as.numeric(input$grup_select) })
+  
+  all_matches_events <- reactive({ all_matches_events_all %>% filter(categoria == cat_sel(), grup == g()) })
+  all_matches_lineups<- reactive({ all_matches_lineups_all %>% filter(categoria == cat_sel(), grup == g()) })
+  all_matches_info   <- reactive({ all_matches_info_all   %>% filter(categoria == cat_sel(), grup == g()) })
+  player_match_stats <- reactive({ player_match_stats_all %>% filter(categoria == cat_sel(), grup == g()) })
+  player_stats       <- reactive({ player_stats_all       %>% filter(categoria == cat_sel(), grup == g()) })
+  standings_by_round <- reactive({ standings_by_round_all %>% filter(categoria == cat_sel(), grup == g()) })
+  matches            <- reactive({ matches_all            %>% filter(categoria == cat_sel(), grup == g()) })
   
   team_match_stats <- reactive({
     team_match_stats_all %>%
-      filter(grup == g()) %>%
+      filter(categoria == cat_sel(), grup == g()) %>%
       mutate(team_points = case_when(
         goals_for > goals_against ~ 3,
         goals_for == goals_against ~ 1,
@@ -774,7 +1115,7 @@ server <- function(input, output, session) {
   # UI DINÀMICS (selectors que depenen del grup)
   # ==========================================================================
   output$inici_title <- renderUI({
-    h2(paste0("⚽ Tercera Catalana 2025-2026 · Grup ", g()))
+    h2(paste0("⚽ ", categoria_label(cat_sel()), " 2025-2026 · Grup ", g()))
   })
   output$jornada_select_ui <- renderUI({
     req(nrow(matches()) > 0)
@@ -897,19 +1238,21 @@ server <- function(input, output, session) {
   })
   
   output$modal_gols_evolucio <- renderPlotly({
-    data <- modal_match_data() %>% mutate(gols_acum = cumsum(goals))
+    data <- modal_match_data() %>% mutate(gols_acum = cumsum(goals), player_chr = as.character(selected_player_modal()))
+    if(nrow(data)==0) return(plotly_empty())
     p <- ggplot(data, aes(x=jornada, y=gols_acum, text=paste("Jornada:",jornada,"<br>Gols acum.:",gols_acum))) +
-      geom_line(color="darkgreen",size=1.2) +
+      geom_line(color="darkgreen",linewidth=1.2) +
       geom_point(data=filter(data,goals>0),color="red",size=3,shape=17) +
       geom_point(color="darkgreen",size=1.5) +
       labs(x="Jornada",y="Gols acumulats",title="Gols Acumulats") + theme_minimal(base_size=11)
     ggplotly(p, tooltip="text") %>% layout(margin=list(t=30))
   })
   output$modal_minuts_jornada <- renderPlotly({
-    data <- modal_match_data()
-    p <- ggplot(data, aes(x=jornada,y=minutes_played,fill=factor(starter),
+    data <- modal_match_data() %>% mutate(starter_lbl = factor(ifelse(starter==1,"Titular","Suplent"), levels=c("Titular","Suplent")))
+    if(nrow(data)==0) return(plotly_empty())
+    p <- ggplot(data, aes(x=jornada,y=minutes_played,fill=starter_lbl,
                           text=paste("Jornada:",jornada,"<br>Minuts:",minutes_played))) +
-      geom_col() + scale_fill_manual(values=c("0"="#e67e22","1"="steelblue"),labels=c("Suplent","Titular")) +
+      geom_col() + scale_fill_manual(values=c("Suplent"="#e67e22","Titular"="steelblue")) +
       labs(x="Jornada",y="Minuts",fill="",title="Minuts per Jornada") + theme_minimal(base_size=11)
     ggplotly(p,tooltip="text") %>% layout(margin=list(t=30))
   })
@@ -930,7 +1273,7 @@ server <- function(input, output, session) {
     player_name <- selected_player_modal()
     matches_data <- modal_match_data() %>% arrange(desc(jornada)) %>% head(8)
     if (nrow(matches_data) == 0) return(NULL)
-    evs <- all_matches_events() %>% filter(player == player_name) %>% dplyr::select(jornada, event_type, detail)
+    evs <- all_matches_events() %>% filter(player == player_name) %>% select(jornada, event_type, detail)
     rows_html <- lapply(1:nrow(matches_data), function(i) {
       r <- matches_data[i,]; j <- r$jornada
       m_row <- matches() %>% filter(jornada == j, (local_team == r$team | away_team == r$team))
@@ -996,12 +1339,12 @@ server <- function(input, output, session) {
   })
   output$inici_classificacio <- renderDT({
     current_standings() %>%
-      dplyr::select(Pos=position, Equip=team, PJ=played, Pts=points) %>%
+      select(Pos=position, Equip=team, PJ=played, Pts=points) %>%
       datatable(options=list(dom='t',pageLength=20,ordering=FALSE), rownames=FALSE)
   })
   output$inici_golejadors <- renderDT({
     player_stats() %>% filter(goals>0) %>% arrange(desc(goals)) %>% head(10) %>%
-      dplyr::select(Jugador=player, Equip=team, Gols=goals) %>%
+      select(Jugador=player, Equip=team, Gols=goals) %>%
       datatable(options=list(dom='t',pageLength=10,ordering=FALSE), rownames=FALSE, escape=FALSE)
   })
   output$inici_ultima_jornada <- renderUI({
@@ -1027,7 +1370,7 @@ server <- function(input, output, session) {
     req(input$jornada_select)
     j <- as.numeric(input$jornada_select)
     m <- matches() %>% filter(jornada==j) %>% arrange(local_team)
-    info <- all_matches_info() %>% filter(jornada==j) %>% dplyr::select(home_team, away_team, date, time, referee)
+    info <- all_matches_info() %>% filter(jornada==j) %>% select(home_team, away_team, date, time, referee)
     # info pot usar home_team
     if ("home_team" %in% names(info)) {
       m <- m %>% left_join(info, by=c("local_team"="home_team","away_team"="away_team"))
@@ -1299,16 +1642,18 @@ server <- function(input, output, session) {
   # CLASSIFICACIÓ
   # ==========================================================================
   output$taula_classificacio <- renderDT({
-    current_standings()%>%dplyr::select(Pos=position,Equip=team,PJ=played,G=wins,E=draws,P=losses,GF=goals_for,GC=goals_against,Pts=points)%>%
+    current_standings()%>%select(Pos=position,Equip=team,PJ=played,G=wins,E=draws,P=losses,GF=goals_for,GC=goals_against,Pts=points)%>%
       datatable(options=list(dom='t',pageLength=20,ordering=FALSE),rownames=FALSE)
   })
   output$grafic_evolucio_posicions <- renderPlotly({
-    p <- ggplot(standings_by_round(),aes(x=jornada,y=position,color=team,group=team,text=paste("Equip:",team,"<br>Jornada:",jornada,"<br>Posició:",position)))+
-      geom_line(size=1)+geom_point(size=2)+scale_y_reverse(breaks=1:20)+labs(x="Jornada",y="Posició")+theme_minimal()
+    data <- standings_by_round()%>%mutate(team=as.character(team))
+    if(nrow(data)==0) return(plotly_empty())
+    p <- ggplot(data,aes(x=jornada,y=position,color=team,group=team,text=paste("Equip:",team,"<br>Jornada:",jornada,"<br>Posició:",position)))+
+      geom_line(linewidth=1)+geom_point(size=2)+scale_y_reverse(breaks=1:20)+labs(x="Jornada",y="Posició")+theme_minimal()
     ggplotly(p,tooltip="text")
   })
   output$stats_heatmap <- renderPlotly({
-    data <- team_match_stats()%>%dplyr::select(team,jornada,team_points)%>%mutate(res=case_when(team_points==3~"V",team_points==1~"E",TRUE~"D"))
+    data <- team_match_stats()%>%select(team,jornada,team_points)%>%mutate(res=case_when(team_points==3~"V",team_points==1~"E",TRUE~"D"))
     p <- ggplot(data,aes(x=jornada,y=team,fill=factor(team_points),text=paste("Equip:",team,"<br>Jornada:",jornada,"<br>Resultat:",res)))+
       geom_tile(color="white",size=0.5)+scale_fill_manual(values=c("0"="#e74c3c","1"="#f1c40f","3"="#2ecc71"),labels=c("Derrota","Empat","Victòria"))+
       labs(x="Jornada",y="",fill="Resultat")+theme_minimal()+theme(axis.text.y=element_text(size=8))
@@ -1384,10 +1729,10 @@ server <- function(input, output, session) {
              gc=ifelse(jugat,ifelse(local_team==eq,goals_away,goals_home),NA_integer_),
              Resultat=case_when(!jugat~"Pendent",gf>gc~paste0(gf," - ",gc),gf==gc~paste0(gf," - ",gc),TRUE~paste0(gf," - ",gc)),
              Punts=case_when(!jugat~NA_character_,gf>gc~"V",gf==gc~"E",TRUE~"D"))
-    info_eq <- all_matches_info()%>%filter(home_team==eq|away_team==eq)%>%dplyr::select(jornada,home_team,away_team,date,time,referee)
+    info_eq <- all_matches_info()%>%filter(home_team==eq|away_team==eq)%>%select(jornada,home_team,away_team,date,time,referee)
     cal_info <- cal%>%left_join(info_eq,by=c("jornada"="jornada","local_team"="home_team","away_team"="away_team"))%>%
       mutate(Data=ifelse(!is.na(date)&date!="",date,""),Hora=ifelse(!is.na(time)&time!="",time,""),Arbitre=ifelse(!is.na(referee)&referee!="",referee,""))%>%
-      dplyr::select(Jornada=jornada,`C/F`=loc_vis,Rival=rival,Resultat,V_E_D=Punts,Data,Hora,Arbitre)
+      select(Jornada=jornada,`C/F`=loc_vis,Rival=rival,Resultat,V_E_D=Punts,Data,Hora,Arbitre)
     datatable(cal_info,rownames=FALSE,options=list(pageLength=30,dom='ft',ordering=FALSE,columnDefs=list(list(className='dt-center',targets=c(0,1,3,4,5,6)))))%>%
       formatStyle('V_E_D',backgroundColor=styleEqual(c("V","E","D"),c("#d5f5e3","#fef9e7","#fadbd8")),fontWeight="bold")
   })
@@ -1413,11 +1758,12 @@ server <- function(input, output, session) {
   
   output$equip_punts_evolucio <- renderPlotly({
     data <- equip_data()%>%mutate(punts_acum=cumsum(team_points))
-    p <- ggplot(data,aes(x=jornada,y=punts_acum,text=paste("Jornada:",jornada,"<br>Punts:",punts_acum)))+geom_line(color="steelblue",size=1.5)+geom_point(size=3,color="darkblue")+labs(x="Jornada",y="Punts Acumulats")+theme_minimal()
+    if(nrow(data)==0) return(plotly_empty())
+    p <- ggplot(data,aes(x=jornada,y=punts_acum,text=paste("Jornada:",jornada,"<br>Punts:",punts_acum)))+geom_line(color="steelblue",linewidth=1.5)+geom_point(size=3,color="darkblue")+labs(x="Jornada",y="Punts Acumulats")+theme_minimal()
     ggplotly(p,tooltip="text")
   })
   output$equip_gols_jornada <- renderPlotly({
-    data <- equip_data()%>%dplyr::select(jornada,goals_for,goals_against)%>%pivot_longer(c(goals_for,goals_against),names_to="tipus",values_to="gols")%>%mutate(tipus=ifelse(tipus=="goals_for","A favor","En contra"))
+    data <- equip_data()%>%select(jornada,goals_for,goals_against)%>%pivot_longer(c(goals_for,goals_against),names_to="tipus",values_to="gols")%>%mutate(tipus=ifelse(tipus=="goals_for","A favor","En contra"))
     p <- ggplot(data,aes(x=jornada,y=gols,fill=tipus,text=paste("Jornada:",jornada,"<br>",tipus,":",gols)))+geom_col(position="dodge")+scale_fill_manual(values=c("A favor"="green","En contra"="red"))+labs(x="Jornada",y="Gols",fill="")+theme_minimal()
     ggplotly(p,tooltip="text")
   })
@@ -1427,45 +1773,50 @@ server <- function(input, output, session) {
     ggplotly(p,tooltip="text")
   })
   output$equip_gols_periode <- renderPlotly({
-    eq <- input$equip_select
+    eq <- req(input$equip_select)
+    evts <- all_matches_events()
     data <- bind_rows(
-      all_matches_events()%>%filter(event_type=="Gol",team==eq)%>%mutate(type="Gols a favor"),
-      all_matches_events()%>%filter(event_type=="Gol",(home_team==eq&team!=eq)|(away_team==eq&team!=eq))%>%mutate(type="Gols en contra")
+      evts%>%filter(event_type=="Gol",team==eq)%>%mutate(type="Gols a favor"),
+      evts%>%filter(event_type=="Gol",(home_team==eq&team!=eq)|(away_team==eq&team!=eq))%>%mutate(type="Gols en contra")
     )%>%mutate(period=case_when(minute<=15~"0-15'",minute<=30~"16-30'",minute<=45~"31-45'",minute<=60~"46-60'",minute<=75~"61-75'",minute<=90~"76-90'",TRUE~"90+'"))%>%mutate(period=factor(period,levels=c("0-15'","16-30'","31-45'","46-60'","61-75'","76-90'","90+'")))
     if(nrow(data)==0) return(plotly_empty())
     p <- ggplot(data,aes(x=period,fill=type))+geom_bar(position="dodge")+scale_fill_manual(values=c("Gols a favor"="green","Gols en contra"="red"))+labs(x="Període",y="Gols",fill="")+theme_minimal()
     ggplotly(p)
   })
   output$equip_efectivitat_parts <- renderPlotly({
-    eq <- input$equip_select
+    eq <- req(input$equip_select)
+    evts <- all_matches_events()
     data <- bind_rows(
-      all_matches_events()%>%filter(event_type=="Gol",team==eq)%>%mutate(type="Gols marcats"),
-      all_matches_events()%>%filter(event_type=="Gol",(home_team==eq&team!=eq)|(away_team==eq&team!=eq))%>%mutate(type="Gols rebuts")
+      evts%>%filter(event_type=="Gol",team==eq)%>%mutate(type="Gols marcats"),
+      evts%>%filter(event_type=="Gol",(home_team==eq&team!=eq)|(away_team==eq&team!=eq))%>%mutate(type="Gols rebuts")
     )%>%mutate(half=if_else(minute<=45,"Primera part","Segona part"))%>%count(half,type)
     if(nrow(data)==0) return(plotly_empty())
     p <- ggplot(data,aes(x=half,y=n,fill=type))+geom_col(position="dodge")+geom_text(aes(label=n),position=position_dodge(width=0.9),vjust=-0.4)+scale_fill_manual(values=c("Gols marcats"="green","Gols rebuts"="red"))+labs(x="",y="Gols",fill="")+theme_minimal()
     ggplotly(p)
   })
   output$equip_carrega_treball <- renderPlotly({
-    data <- player_match_stats()%>%filter(team==input$equip_select)%>%group_by(player)%>%summarise(total_minutes=sum(minutes_played),avg_minutes=mean(minutes_played),matches=n(),.groups="drop")
+    eq <- req(input$equip_select)
+    data <- player_match_stats()%>%filter(team==eq)%>%group_by(player)%>%summarise(total_minutes=sum(minutes_played),avg_minutes=mean(minutes_played),matches=n(),.groups="drop")
+    if(nrow(data)==0) return(plotly_empty())
     p <- ggplot(data,aes(x=avg_minutes,y=matches,size=total_minutes,color=total_minutes,text=paste(player,"<br>Total min:",total_minutes,"<br>Promig:",round(avg_minutes,1),"<br>Partits:",matches)))+geom_point(alpha=0.7)+scale_color_gradient(low="yellow",high="darkgreen")+labs(x="Minuts promig per partit",y="Partits jugats")+theme_minimal()+theme(legend.position="none")
     ggplotly(p,tooltip="text")
   })
   output$equip_jugadors <- renderDT({
-    data <- player_match_stats()%>%filter(team==input$equip_select)%>%group_by(player)%>%
+    eq <- req(input$equip_select)
+    data <- player_match_stats()%>%filter(team==eq)%>%group_by(player)%>%
       summarise(Partits=n(),Titularitats=sum(starter),Minuts=sum(minutes_played),Gols=sum(goals),Grogues=sum(yellow_cards),Vermelles=sum(red_cards),.groups="drop")%>%
-      left_join(player_impact()%>%dplyr::select(player,impacte),by="player")%>%
-      left_join(player_ratings()%>%dplyr::select(player,rating_global),by="player")%>%
+      left_join(player_impact()%>%select(player,impacte),by="player")%>%
+      left_join(player_ratings()%>%select(player,rating_global),by="player")%>%
       mutate(Impacte=round(impacte,2),Rating=rating_global)%>%arrange(desc(Minuts))%>%
       mutate(Jugador=sapply(player,player_link_js))%>%
-      dplyr::select(Jugador,Rating,Partits,Titularitats,Minuts,Gols,Grogues,Vermelles,Impacte)
+      select(Jugador,Rating,Partits,Titularitats,Minuts,Gols,Grogues,Vermelles,Impacte)
     datatable(data,escape=FALSE,options=list(pageLength=20,ordering=TRUE),rownames=FALSE)
   })
   output$equip_vs_nivell <- renderPlotly({
-    team_name <- input$equip_select
+    team_name <- req(input$equip_select)
     n_teams <- nrow(current_standings())
     top_n <- floor(n_teams/3); bot_n <- floor(n_teams/3)
-    rank_lookup <- current_standings()%>%mutate(nivell=case_when(position<=top_n~"TOP",position>n_teams-bot_n~"CUA",TRUE~"MITJA"))%>%dplyr::select(rival=team,nivell)
+    rank_lookup <- current_standings()%>%mutate(nivell=case_when(position<=top_n~"TOP",position>n_teams-bot_n~"CUA",TRUE~"MITJA"))%>%select(rival=team,nivell)
     data <- team_match_stats()%>%filter(team==team_name)%>%left_join(rank_lookup,by=c("opponent"="rival"))%>%mutate(nivell=replace_na(nivell,"MITJA"))%>%
       group_by(nivell)%>%summarise(PJ=n(),V=sum(team_points==3),E=sum(team_points==1),D=sum(team_points==0),pts_avg=round(mean(team_points),2),.groups="drop")%>%
       mutate(nivell=factor(nivell,levels=c("TOP","MITJA","CUA")),color=case_when(nivell=="TOP"~"#e74c3c",nivell=="MITJA"~"#f39c12",TRUE~"#27ae60"),label_hover=paste0("<b>vs ",nivell,"</b><br>",PJ," partits: ",V,"V ",E,"E ",D,"D<br>",pts_avg," pts/partit"))%>%arrange(nivell)
@@ -1473,8 +1824,10 @@ server <- function(input, output, session) {
       layout(xaxis=list(title="Nivell del rival",tickfont=list(size=12)),yaxis=list(title="Pts/partit",range=c(0,3.2),zeroline=FALSE),plot_bgcolor="#fafafa",paper_bgcolor="white",margin=list(t=10,b=40,l=50,r=10))
   })
   output$equip_dependencia_gols <- renderPlotly({
-    team_name <- input$equip_select
+    team_name <- req(input$equip_select)
+    validate(need(length(team_name)==1 && nchar(team_name)>0, "Selecciona un equip"))
     total_gols <- team_match_stats()%>%filter(team==team_name)%>%summarise(g=sum(goals_for,na.rm=TRUE))%>%pull(g)
+    if(length(total_gols)==0) total_gols <- 0
     if(total_gols==0) return(plot_ly()%>%layout(title="Sense gols marcats"))
     data <- all_matches_events()%>%filter(team==team_name,event_type%in%c("Gol","Goal","goal"))%>%count(player,name="gols")%>%arrange(desc(gols))%>%
       mutate(pct=round(100*gols/total_gols,1),player_short=ifelse(nchar(player)>20,paste0(substr(player,1,18),"…"),player))%>%head(10)
@@ -1503,7 +1856,11 @@ server <- function(input, output, session) {
             div(div(style="font-size:13px;font-weight:bold;",label),
                 if(show_detail) div(style="font-size:11px;color:#666;margin-top:3px;",paste0(row$pts_real_avg," pts/partit en els últims ",row$n_recents," partits  ·  ",diff_txt)))))
   }
-  output$equip_tilt_box <- renderUI({ render_tilt_ui(input$equip_select, show_detail=TRUE) })
+  output$equip_tilt_box <- renderUI({
+    eq <- req(input$equip_select)
+    validate(need(length(eq)==1 && nchar(eq)>0, ""))
+    render_tilt_ui(eq, show_detail=TRUE)
+  })
   
   # ==========================================================================
   # COMPARADOR D'EQUIPS
@@ -1566,8 +1923,9 @@ output$comp_punts_evolucio <- renderPlotly({
   t1<-req(input$comp_equip1);t2<-req(input$comp_equip2)
   d1<-team_match_stats()%>%filter(team==t1)%>%arrange(jornada)%>%mutate(punts_acum=cumsum(team_points),equip=t1)
   d2<-team_match_stats()%>%filter(team==t2)%>%arrange(jornada)%>%mutate(punts_acum=cumsum(team_points),equip=t2)
-  data<-bind_rows(d1,d2)
-  p<-ggplot(data,aes(x=jornada,y=punts_acum,color=equip,group=equip,text=paste(equip,"· J",jornada,":",punts_acum,"pts")))+geom_line(size=1.4)+geom_point(size=2)+scale_color_manual(values=setNames(c("#1a6b8a","#c0392b"),c(t1,t2)))+labs(x="Jornada",y="Punts Acumulats",color="")+theme_minimal()
+  data<-bind_rows(d1,d2)%>%mutate(equip=as.character(equip))
+  if(nrow(data)==0) return(plotly_empty())
+  p<-ggplot(data,aes(x=jornada,y=punts_acum,color=equip,group=equip,text=paste(equip,"· J",jornada,":",punts_acum,"pts")))+geom_line(linewidth=1.4)+geom_point(size=2)+scale_color_manual(values=setNames(c("#1a6b8a","#c0392b"),c(t1,t2)))+labs(x="Jornada",y="Punts Acumulats",color="")+theme_minimal()
   ggplotly(p,tooltip="text")
 })
 output$comp_casa_fora <- renderPlotly({
@@ -1613,7 +1971,7 @@ output$comp_golejadors <- renderUI({
 # JUGADORS
 # ==========================================================================
 output$taula_jugadors <- renderDT({
-  data<-player_stats()%>%left_join(player_ratings()%>%dplyr::select(player,team,rating_global),by=c("player","team"))%>%arrange(desc(rating_global))%>%mutate(Jugador=sapply(player,player_link_js))%>%dplyr::select(Jugador,Equip=team,Rating=rating_global,Partits=matches_played,Titularitats=starts,Minuts=total_minutes,Gols=goals,`Gols/90`=goals_per_90,`Targetes/90`=cards_per_90)
+  data<-player_stats()%>%left_join(player_ratings()%>%select(player,team,rating_global),by=c("player","team"))%>%arrange(desc(rating_global))%>%mutate(Jugador=sapply(player,player_link_js))%>%select(Jugador,Equip=team,Rating=rating_global,Partits=matches_played,Titularitats=starts,Minuts=total_minutes,Gols=goals,`Gols/90`=goals_per_90,`Targetes/90`=cards_per_90)
   datatable(data,escape=FALSE,filter="top",rownames=FALSE,options=list(pageLength=20,scrollX=TRUE,order=list(list(2,'desc'))))
 })
 
@@ -1657,10 +2015,11 @@ output$compjug_stats_taula <- renderUI({
 })
 output$compjug_gols_evolucio <- renderPlotly({
   j1<-req(input$comp_jug1);j2<-req(input$comp_jug2)
-  d1<-player_match_stats()%>%filter(player==j1)%>%arrange(jornada)%>%mutate(gols_acum=cumsum(goals),jugador=j1)
-  d2<-player_match_stats()%>%filter(player==j2)%>%arrange(jornada)%>%mutate(gols_acum=cumsum(goals),jugador=j2)
-  data<-bind_rows(d1,d2); if(nrow(data)==0) return(plotly_empty())
-  p<-ggplot(data,aes(x=jornada,y=gols_acum,color=jugador,group=jugador,text=paste(jugador,"· J",jornada,":",gols_acum,"gols")))+geom_line(size=1.3)+geom_point(size=2)+scale_color_manual(values=setNames(c("#1a6b8a","#c0392b"),c(j1,j2)))+labs(x="Jornada",y="Gols acumulats",color="")+theme_minimal()
+  d1<-player_match_stats()%>%filter(as.character(player)==j1)%>%arrange(jornada)%>%mutate(gols_acum=cumsum(goals),jugador=j1)
+  d2<-player_match_stats()%>%filter(as.character(player)==j2)%>%arrange(jornada)%>%mutate(gols_acum=cumsum(goals),jugador=j2)
+  data<-bind_rows(d1,d2)%>%mutate(jugador=as.character(jugador))
+  if(nrow(data)==0) return(plotly_empty())
+  p<-ggplot(data,aes(x=jornada,y=gols_acum,color=jugador,group=jugador,text=paste(jugador,"· J",jornada,":",gols_acum,"gols")))+geom_line(linewidth=1.3)+geom_point(size=2)+scale_color_manual(values=setNames(c("#1a6b8a","#c0392b"),c(j1,j2)))+labs(x="Jornada",y="Gols acumulats",color="")+theme_minimal()
   ggplotly(p,tooltip="text")
 })
 output$compjug_minuts <- renderPlotly({
@@ -1706,18 +2065,45 @@ output$stats_total_targetes <- renderValueBox({
 })
 
 output$stats_gols_minut <- renderPlotly({
-  data<-all_matches_events()%>%filter(event_type=="Gol",!is.na(minute))
-  p<-ggplot(data,aes(x=minute))+geom_histogram(binwidth=5,fill="steelblue",color="white")+geom_vline(xintercept=45,linetype="dashed",color="red")+labs(x="Minut",y="Gols")+theme_minimal()
+  data <- all_matches_events()%>%filter(event_type=="Gol",!is.na(minute))
+  if(nrow(data)==0) return(plotly_empty())
+  p <- ggplot(data,aes(x=minute))+
+    geom_histogram(binwidth=5,fill="steelblue",color="white")+
+    geom_vline(xintercept=45,linetype="dashed",color="red")+
+    scale_x_continuous(breaks=seq(0,120,by=15), limits=c(0,120))+
+    labs(x="Minut",y="Gols")+theme_minimal()
   ggplotly(p)
 })
 output$stats_gols_jornada <- renderPlotly({
-  data<-team_match_stats()%>%group_by(jornada)%>%summarise(gols=sum(goals_for,na.rm=TRUE),.groups="drop")%>%mutate(tooltip=paste0("J",jornada,": ",gols," gols"))
-  avg<-round(mean(data$gols),1)
-  plot_ly(data,x=~jornada,y=~gols,type="bar",marker=list(color="#3498db",opacity=0.8),text=~tooltip,hoverinfo="text",textposition="none",showlegend=FALSE)%>%add_lines(x=~jornada,y=avg,line=list(color="#e74c3c",width=2,dash="dash"),name=paste0("Mitjana: ",avg),hoverinfo="none")%>%layout(xaxis=list(title="Jornada",dtick=1),yaxis=list(title="Gols totals",zeroline=FALSE),plot_bgcolor="#fafafa",paper_bgcolor="white",showlegend=TRUE,legend=list(x=0.75,y=1),margin=list(t=10,b=40,l=50,r=10))
+  data <- team_match_stats()%>%group_by(jornada)%>%summarise(gols=sum(goals_for,na.rm=TRUE),.groups="drop")%>%mutate(tooltip=paste0("J",jornada,": ",gols," gols"))
+  if(nrow(data)==0) return(plotly_empty())
+  avg <- round(mean(data$gols),1)
+  n_jornades <- nrow(data)
+  plot_ly(data,x=~jornada,y=~gols,type="bar",
+          marker=list(color="#3498db",opacity=0.8),
+          text=~tooltip,hoverinfo="text",textposition="none",showlegend=FALSE,
+          width=NULL)%>%
+    add_lines(x=~jornada,y=avg,line=list(color="#e74c3c",width=2,dash="dash"),
+              name=paste0("Mitjana: ",avg),hoverinfo="none")%>%
+    layout(xaxis=list(title="Jornada",tickmode="linear",tick0=1,dtick=max(1,floor(n_jornades/15))),
+           yaxis=list(title="Gols totals",zeroline=FALSE),
+           bargap=0.3,
+           plot_bgcolor="#fafafa",paper_bgcolor="white",
+           showlegend=TRUE,legend=list(x=0.75,y=1),
+           margin=list(t=10,b=40,l=50,r=10))
 })
 output$stats_targetes_jornada <- renderPlotly({
-  data<-team_match_stats()%>%group_by(jornada)%>%summarise(grogues=sum(yellow_cards,na.rm=TRUE),vermelles=sum(red_cards,na.rm=TRUE),.groups="drop")
-  plot_ly(data,x=~jornada)%>%add_bars(y=~grogues,name="Grogues",marker=list(color="#f39c12"),text=~paste0("J",jornada,": ",grogues," grogues"),hoverinfo="text",textposition="none")%>%add_bars(y=~vermelles,name="Vermelles",marker=list(color="#e74c3c"),text=~paste0("J",jornada,": ",vermelles," vermelles"),hoverinfo="text",textposition="none")%>%layout(barmode="stack",xaxis=list(title="Jornada",dtick=1),yaxis=list(title="Targetes",zeroline=FALSE),plot_bgcolor="#fafafa",paper_bgcolor="white",legend=list(x=0.75,y=1),margin=list(t=10,b=40,l=50,r=10))
+  data <- team_match_stats()%>%group_by(jornada)%>%summarise(grogues=sum(yellow_cards,na.rm=TRUE),vermelles=sum(red_cards,na.rm=TRUE),.groups="drop")
+  if(nrow(data)==0) return(plotly_empty())
+  n_jornades <- nrow(data)
+  plot_ly(data,x=~jornada)%>%
+    add_bars(y=~grogues,name="Grogues",marker=list(color="#f39c12"),text=~paste0("J",jornada,": ",grogues," grogues"),hoverinfo="text",textposition="none")%>%
+    add_bars(y=~vermelles,name="Vermelles",marker=list(color="#e74c3c"),text=~paste0("J",jornada,": ",vermelles," vermelles"),hoverinfo="text",textposition="none")%>%
+    layout(barmode="stack",bargap=0.3,
+           xaxis=list(title="Jornada",tickmode="linear",tick0=1,dtick=max(1,floor(n_jornades/15))),
+           yaxis=list(title="Targetes",zeroline=FALSE),
+           plot_bgcolor="#fafafa",paper_bgcolor="white",
+           legend=list(x=0.75,y=1),margin=list(t=10,b=40,l=50,r=10))
 })
 output$stats_resultats_comuns <- renderPlotly({
   data<-matches()%>%filter(!is.na(goals_home))%>%mutate(resultat=paste0(goals_home,"-",goals_away))%>%count(resultat,name="freq")%>%arrange(desc(freq))%>%head(12)%>%
@@ -1740,7 +2126,7 @@ output$stats_targetes <- renderPlotly({
   ggplotly(p,tooltip="text")
 })
 output$stats_targetes_punts <- renderPlotly({
-  data<-team_match_stats()%>%group_by(team)%>%summarise(targetes=sum(yellow_cards,na.rm=TRUE)+3*sum(red_cards,na.rm=TRUE),punts=sum(team_points,na.rm=TRUE),.groups="drop")%>%left_join(current_standings()%>%dplyr::select(team,position),by="team")%>%mutate(color=colorRampPalette(c("#27ae60","#f39c12","#e74c3c"))(n())[rank(targetes)],tooltip=paste0("<b>",team,"</b><br>Targetes (pond.): ",targetes,"<br>Punts: ",punts))
+  data<-team_match_stats()%>%group_by(team)%>%summarise(targetes=sum(yellow_cards,na.rm=TRUE)+3*sum(red_cards,na.rm=TRUE),punts=sum(team_points,na.rm=TRUE),.groups="drop")%>%left_join(current_standings()%>%select(team,position),by="team")%>%mutate(color=colorRampPalette(c("#27ae60","#f39c12","#e74c3c"))(n())[rank(targetes)],tooltip=paste0("<b>",team,"</b><br>Targetes (pond.): ",targetes,"<br>Punts: ",punts))
   fit<-lm(punts~targetes,data=data);xr<-seq(min(data$targetes),max(data$targetes),length.out=50);yr<-predict(fit,newdata=data.frame(targetes=xr));trend_df<-data.frame(x=xr,y=yr)
   plot_ly()%>%add_markers(data=data,x=~targetes,y=~punts,text=~tooltip,hoverinfo="text",marker=list(size=14,color=~color,line=list(color="white",width=1.5)),showlegend=FALSE)%>%add_lines(data=trend_df,x=~x,y=~y,line=list(color="#aaa",width=1.5,dash="dot"),hoverinfo="none",showlegend=FALSE)%>%add_annotations(data=data,x=~targetes,y=~punts,text=~team,showarrow=FALSE,yshift=11,font=list(size=8,color="#555"),bgcolor="rgba(255,255,255,0.7)",borderpad=1)%>%layout(xaxis=list(title="Targetes (grogues + 3×vermelles)",zeroline=FALSE),yaxis=list(title="Punts totals",zeroline=FALSE),plot_bgcolor="#fafafa",paper_bgcolor="white",margin=list(t=10,b=50,l=55,r=10))
 })
@@ -1753,30 +2139,45 @@ output$stats_ranking_defensa <- renderPlotly({
   plot_ly(data,x=~gols_contra,y=~reorder(team,-gols_contra),type="bar",orientation="h",marker=list(color=~color,line=list(color="white",width=0.5)),text=~tooltip,hoverinfo="text",textposition="none",showlegend=FALSE)%>%layout(xaxis=list(title="Gols encaixats",zeroline=FALSE),yaxis=list(title="",tickfont=list(size=8)),plot_bgcolor="#fafafa",paper_bgcolor="white",margin=list(t=10,b=40,l=170,r=40))
 })
 output$stats_rating_tilt <- renderPlotly({
-  data<-team_ratings()%>%left_join(tilt_data()%>%dplyr::select(team,tilt,pts_real_avg,pts_expected_avg),by="team")%>%left_join(current_standings()%>%dplyr::select(team,position,points),by="team")%>%
+  data<-team_ratings()%>%left_join(tilt_data()%>%select(team,tilt,pts_real_avg,pts_expected_avg),by="team")%>%left_join(current_standings()%>%select(team,position,points),by="team")%>%
     mutate(tilt_label=sprintf("%+.2f",tilt),dinamica=case_when(tilt>0.5~"Molt bona dinàmica",tilt>0.1~"Bona dinàmica",tilt>-0.1~"Dinàmica neutra",tilt>-0.5~"Mala dinàmica",TRUE~"Molt mala dinàmica"),tooltip=paste0("<b>",team,"</b><br>Posició: #",position,"  ·  Punts: ",points,"<br>Rating: ",rating,"<br>Tilt: ",tilt_label,"  →  ",dinamica),quadrant=case_when(rating>=50&tilt>=0~"Alt Rating · Bon Momentum",rating>=50&tilt<0~"Alt Rating · Mal Momentum",rating<50&tilt>=0~"Baix Rating · Bon Momentum",TRUE~"Baix Rating · Mal Momentum"),color_q=case_when(quadrant=="Alt Rating · Bon Momentum"~"#27ae60",quadrant=="Alt Rating · Mal Momentum"~"#e67e22",quadrant=="Baix Rating · Bon Momentum"~"#3498db",TRUE~"#e74c3c"))
   x_min<-min(data$tilt,na.rm=TRUE)-0.15;x_max<-max(data$tilt,na.rm=TRUE)+0.15;y_min<-min(data$rating,na.rm=TRUE)-5;y_max<-max(data$rating,na.rm=TRUE)+5
   plot_ly(data,x=~tilt,y=~rating,text=~tooltip,hoverinfo="text",type="scatter",mode="markers",marker=list(size=20,color=~color_q,line=list(color="white",width=2),opacity=0.88),showlegend=FALSE)%>%add_annotations(x=~tilt,y=~rating,text=~team,showarrow=FALSE,yshift=14,font=list(size=9,color="#333"),bgcolor="rgba(255,255,255,0.75)",borderpad=2)%>%layout(shapes=list(list(type="line",x0=0,x1=0,y0=y_min,y1=y_max,line=list(color="#bbb",width=1,dash="dot")),list(type="line",x0=x_min,x1=x_max,y0=50,y1=50,line=list(color="#bbb",width=1,dash="dot"))),xaxis=list(title="Tilt (momentum recent)",zeroline=FALSE,tickformat="+.2f",range=c(x_min,x_max)),yaxis=list(title="Rating Global",zeroline=FALSE,range=c(y_min,y_max)),annotations=list(list(x=x_max,y=y_max,text="Favorits en forma",showarrow=FALSE,font=list(size=10,color="#27ae60"),xanchor="right",yanchor="top"),list(x=x_min,y=y_max,text="Favorits en crisi",showarrow=FALSE,font=list(size=10,color="#e67e22"),xanchor="left",yanchor="top"),list(x=x_max,y=y_min,text="Underdog en forma",showarrow=FALSE,font=list(size=10,color="#3498db"),xanchor="right",yanchor="bottom"),list(x=x_min,y=y_min,text="Cua en crisi",showarrow=FALSE,font=list(size=10,color="#e74c3c"),xanchor="left",yanchor="bottom")),margin=list(t=20,b=60,l=60,r=20),plot_bgcolor="#fafafa",paper_bgcolor="white")
 })
 output$stats_latents_atac_defensa <- renderPlotly({
-  data<-team_ratings()%>%left_join(current_standings()%>%dplyr::select(team,position,points),by="team")%>%
+  data<-team_ratings()%>%left_join(current_standings()%>%select(team,position,points),by="team")%>%
     mutate(quadrant=case_when(attack>=0&defense>=0~"Bons en atac i defensa",attack>=0&defense<0~"Bon atac, mala defensa",attack<0&defense>=0~"Mal atac, bona defensa",TRUE~"Febles en atac i defensa"),color_q=case_when(quadrant=="Bons en atac i defensa"~"#27ae60",quadrant=="Bon atac, mala defensa"~"#e67e22",quadrant=="Mal atac, bona defensa"~"#3498db",TRUE~"#e74c3c"),tooltip=paste0("<b>",team,"</b><br>Posició: #",position,"  ·  Punts: ",points,"<br>Atac: ",sprintf("%+.3f",attack),"<br>Defensa: ",sprintf("%+.3f",defense),"<br>Partits: ",n_matches,"<br>",quadrant))
   x_min<-min(data$attack,na.rm=TRUE)*1.15;x_max<-max(data$attack,na.rm=TRUE)*1.15;y_min<-min(data$defense,na.rm=TRUE)*1.15;y_max<-max(data$defense,na.rm=TRUE)*1.15
   plot_ly(data,x=~attack,y=~defense,text=~tooltip,hoverinfo="text",type="scatter",mode="markers",marker=list(size=~pmin(30,pmax(12,n_matches*1.5)),color=~color_q,line=list(color="white",width=2),opacity=0.85,sizemode="diameter"),showlegend=FALSE)%>%add_annotations(x=~attack,y=~defense,text=~team,showarrow=FALSE,yshift=14,font=list(size=9,color="#333"),bgcolor="rgba(255,255,255,0.75)",borderpad=2)%>%layout(shapes=list(list(type="line",x0=0,x1=0,y0=y_min,y1=y_max,line=list(color="#bbb",width=1,dash="dot")),list(type="line",x0=x_min,x1=x_max,y0=0,y1=0,line=list(color="#bbb",width=1,dash="dot"))),annotations=list(list(x=x_max,y=y_max,text="Millor de tot",showarrow=FALSE,font=list(size=10,color="#27ae60"),xanchor="right",yanchor="top"),list(x=x_max,y=y_min,text="Bon atac / mala def.",showarrow=FALSE,font=list(size=10,color="#e67e22"),xanchor="right",yanchor="bottom"),list(x=x_min,y=y_max,text="Mal atac / bona def.",showarrow=FALSE,font=list(size=10,color="#3498db"),xanchor="left",yanchor="top"),list(x=x_min,y=y_min,text="Pitjor de tot",showarrow=FALSE,font=list(size=10,color="#e74c3c"),xanchor="left",yanchor="bottom")),xaxis=list(title="Força d'Atac (positiu = millor que la mitjana)",zeroline=FALSE,tickformat="+.1f",dtick=0.2,range=c(x_min,x_max)),yaxis=list(title="Força de Defensa (positiu = menys gols rebuts)",zeroline=FALSE,tickformat="+.1f",dtick=0.2,range=c(y_min,y_max)),plot_bgcolor="#fafafa",paper_bgcolor="white",margin=list(t=20,b=60,l=70,r=20))
 })
 output$stats_top_golejadors <- renderPlotly({
-  top_scorers_total<-player_stats()%>%arrange(desc(goals))%>%head(10)
-  top_scorers_evolution<-player_match_stats()%>%filter(player%in%top_scorers_total$player)%>%arrange(player,jornada)%>%group_by(player)%>%mutate(goals_cumsum=cumsum(goals))%>%ungroup()
-  p<-ggplot(top_scorers_evolution,aes(x=jornada,y=goals_cumsum,color=player,group=player,text=paste(player,"<br>Jornada:",jornada,"<br>Gols:",goals_cumsum)))+geom_line(size=1.2)+geom_point(size=2)+labs(x="Jornada",y="Gols acumulats",color="Jugador")+theme_minimal()
+  top_scorers_total <- player_stats()%>%arrange(desc(goals))%>%head(10)
+  if(nrow(top_scorers_total)==0) return(plotly_empty())
+  top_names <- as.character(top_scorers_total$player)
+  top_scorers_evolution <- player_match_stats()%>%
+    filter(as.character(player)%in%top_names)%>%
+    mutate(player=as.character(player))%>%
+    arrange(player,jornada)%>%group_by(player)%>%
+    mutate(goals_cumsum=cumsum(goals))%>%ungroup()
+  if(nrow(top_scorers_evolution)==0) return(plotly_empty())
+  p <- ggplot(top_scorers_evolution,aes(x=jornada,y=goals_cumsum,color=player,group=player,
+                                        text=paste(player,"<br>Jornada:",jornada,"<br>Gols:",goals_cumsum)))+
+    geom_line(linewidth=1.2)+geom_point(size=2)+
+    labs(x="Jornada",y="Gols acumulats",color="Jugador")+theme_minimal()
   ggplotly(p,tooltip="text")
 })
 output$stats_top_targetes <- renderPlotly({
-  data<-player_match_stats()%>%group_by(player,team)%>%summarise(Grogues=sum(yellow_cards),Vermelles=sum(red_cards),Total=Grogues+Vermelles*2,.groups="drop")%>%arrange(desc(Total))%>%head(10)%>%pivot_longer(c(Grogues,Vermelles),names_to="tipus",values_to="n")
-  p<-ggplot(data,aes(x=reorder(player,Total),y=n,fill=tipus,text=paste(player,"·",tipus,":",n)))+geom_col(position="stack")+scale_fill_manual(values=c("Grogues"="#f39c12","Vermelles"="#e74c3c"))+coord_flip()+labs(x="",y="Targetes",fill="")+theme_minimal()
+  data <- player_match_stats()%>%group_by(player,team)%>%
+    summarise(Grogues=sum(yellow_cards),Vermelles=sum(red_cards),Total=Grogues+Vermelles*2,.groups="drop")%>%
+    arrange(desc(Total))%>%head(10)%>%pivot_longer(c(Grogues,Vermelles),names_to="tipus",values_to="n")
+  if(nrow(data)==0) return(plotly_empty())
+  p <- ggplot(data,aes(x=reorder(player,Total),y=n,fill=tipus,text=paste(player,"·",tipus,":",n)))+
+    geom_col(position="stack")+scale_fill_manual(values=c("Grogues"="#f39c12","Vermelles"="#e74c3c"))+
+    coord_flip()+labs(x="",y="Targetes",fill="")+theme_minimal()
   ggplotly(p,tooltip="text")
 })
 output$stats_gols_minuts_reg <- renderPlotly({
-  data<-player_stats()%>%filter(goals>=2,total_minutes>0)%>%left_join(player_ratings()%>%dplyr::select(player,rating_global),by="player")%>%mutate(rating_global=replace_na(rating_global,50),color=colorRampPalette(c("#3498db","#e74c3c"))(100)[pmin(100,pmax(1,round(rating_global)))],tooltip=paste0("<b>",player,"</b><br>Equip: ",team,"<br>",goals," gols · ",total_minutes," min<br>",round(goals/total_minutes*90,2)," gols/90 min"))
+  data<-player_stats()%>%filter(goals>=2,total_minutes>0)%>%left_join(player_ratings()%>%select(player,rating_global),by="player")%>%mutate(rating_global=replace_na(rating_global,50),color=colorRampPalette(c("#3498db","#e74c3c"))(100)[pmin(100,pmax(1,round(rating_global)))],tooltip=paste0("<b>",player,"</b><br>Equip: ",team,"<br>",goals," gols · ",total_minutes," min<br>",round(goals/total_minutes*90,2)," gols/90 min"))
   if(nrow(data)<2) return(plotly_empty())
   fit<-lm(goals~total_minutes,data=data);xr<-seq(min(data$total_minutes),max(data$total_minutes),length.out=60);yr<-predict(fit,newdata=data.frame(total_minutes=xr));trend_df<-data.frame(x=xr,y=yr)
   plot_ly()%>%add_markers(data=data,x=~total_minutes,y=~goals,text=~tooltip,hoverinfo="text",marker=list(size=12,color=~color,line=list(color="white",width=1.5)),showlegend=FALSE)%>%add_lines(data=trend_df,x=~x,y=~y,line=list(color="#e74c3c",width=2,dash="dash"),hoverinfo="none",showlegend=FALSE)%>%layout(xaxis=list(title="Minuts jugats",zeroline=FALSE),yaxis=list(title="Gols",zeroline=FALSE,dtick=1),plot_bgcolor="#fafafa",paper_bgcolor="white",margin=list(t=10,b=50,l=50,r=10))
@@ -1784,6 +2185,522 @@ output$stats_gols_minuts_reg <- renderPlotly({
 output$stats_minuts_per_gol <- renderPlotly({
   data<-player_stats()%>%filter(goals>=2,total_minutes>0)%>%mutate(min_per_gol=round(total_minutes/goals,1),tooltip=paste0("<b>",player,"</b><br>Equip: ",team,"<br>",goals," gols · ",total_minutes," min<br>1 gol cada ",round(total_minutes/goals,1)," min"))%>%arrange(min_per_gol)%>%head(15)
   plot_ly(data,x=~min_per_gol,y=~reorder(player,-min_per_gol),type="bar",orientation="h",marker=list(color=colorRampPalette(c("#27ae60","#f39c12","#e74c3c"))(nrow(data)),line=list(color="white",width=0.5)),text=~tooltip,hoverinfo="text",textposition="none",showlegend=FALSE)%>%layout(xaxis=list(title="Minuts per gol",zeroline=FALSE),yaxis=list(title="",tickfont=list(size=8)),plot_bgcolor="#fafafa",paper_bgcolor="white",margin=list(t=10,b=40,l=160,r=60))
+})
+
+# ==========================================================================
+# SIMULADOR
+# ==========================================================================
+
+# Player ratings calculats pel simulador (de tot el grup, per fer lineup)
+sim_pr <- reactive({
+  pr <- player_ratings()
+  if (nrow(pr) == 0) return(pr)
+  # Normalitzar rating_global 0-100 → escala ~1 per al simulador
+  rng_min <- min(pr$rating_global, na.rm=TRUE)
+  rng_max <- max(pr$rating_global, na.rm=TRUE)
+  pr %>% mutate(
+    rating_global = if(is.finite(rng_min)&&is.finite(rng_max)&&rng_max>rng_min)
+      (rating_global - rng_min)/(rng_max - rng_min) * 0.8 + 0.6
+    else rep(1.0, n())
+  )
+})
+
+sim_lat <- reactive({ team_ratings() })
+
+output$sim_equip_home_ui <- renderUI({
+  selectInput("sim_home", "🏠 Equip Local:", choices = all_teams(),
+              selected = all_teams()[1])
+})
+output$sim_equip_away_ui <- renderUI({
+  teams <- all_teams()
+  selectInput("sim_away", "✈️ Equip Visitant:", choices = teams,
+              selected = teams[min(2, length(teams))])
+})
+
+# Resultats de la simulació (reactiveVal per guardar)
+sim_results_val    <- reactiveVal(NULL)
+sim_single_val     <- reactiveVal(NULL)
+sim_single_ind_val <- reactiveVal(NULL)
+sim_running_val    <- reactiveVal(FALSE)
+sim_mode_val       <- reactiveVal("none")   # "none" | "single" | "montecarlo"
+
+# --- SIMULACIÓ INDIVIDUAL (1 PARTIT) ---
+observeEvent(input$sim_run_single, {
+  req(input$sim_home, input$sim_away)
+  home <- input$sim_home; away <- input$sim_away
+  pr   <- sim_pr(); lat  <- sim_lat()
+  if (nrow(pr) == 0 || nrow(lat) == 0) return()
+  lu_h <- get_lineup_fn(home, pr, 11)
+  lu_a <- get_lineup_fn(away, pr, 11)
+  if (length(lu_h) < 5 || length(lu_a) < 5) return()
+  set.seed(as.integer(Sys.time()) %% 100000)
+  single <- simulate_one_match(home, away, lat, pr, lu_h, lu_a, sim_params)
+  single$home <- home; single$away <- away
+  single$lu_h <- lu_h; single$lu_a <- lu_a
+  sim_single_ind_val(single)
+  sim_mode_val("single")
+})
+
+observeEvent(input$sim_run, {
+  req(input$sim_home, input$sim_away)
+  home <- input$sim_home; away <- input$sim_away
+  n    <- input$sim_n_sims
+  pr   <- sim_pr(); lat  <- sim_lat()
+  
+  if (nrow(pr) == 0 || nrow(lat) == 0) {
+    sim_results_val(NULL); return()
+  }
+  
+  # Obtenir lineups
+  lu_h <- get_lineup_fn(home, pr, 11)
+  lu_a <- get_lineup_fn(away, pr, 11)
+  
+  if (length(lu_h) < 5 || length(lu_a) < 5) {
+    sim_results_val(NULL); return()
+  }
+  
+  sim_running_val(TRUE)
+  
+  # Monte Carlo
+  withProgress(message = paste0("Simulant ", n, " partits..."), value = 0, {
+    mc_list <- lapply(seq_len(n), function(i) {
+      if (i %% 50 == 0) incProgress(50/n)
+      set.seed(i + sample(1e6, 1))
+      r <- simulate_one_match(home, away, lat, pr, lu_h, lu_a, sim_params)
+      if (is.null(r)) return(NULL)
+      data.frame(score_h=r$score_h, score_a=r$score_a, result=r$result,
+                 n_goals=r$n_goals_h+r$n_goals_a,
+                 n_yellows=r$n_yellows_h+r$n_yellows_a,
+                 n_reds=r$n_reds_h+r$n_reds_a, stringsAsFactors=FALSE)
+    })
+  })
+  
+  mc_df <- do.call(rbind, Filter(Negate(is.null), mc_list))
+  sim_results_val(list(df=mc_df, home=home, away=away, lu_h=lu_h, lu_a=lu_a))
+  
+  # Un partit exemple per l'acta del MC
+  set.seed(999)
+  single <- simulate_one_match(home, away, lat, pr, lu_h, lu_a, sim_params, verbose=FALSE)
+  sim_single_val(single)
+  
+  sim_running_val(FALSE)
+  sim_mode_val("montecarlo")
+})
+
+output$sim_running_msg <- renderUI({
+  if (sim_running_val()) {
+    div(style="color:#e67e22;font-weight:bold;padding:6px 0;",
+        tags$i(class="fa fa-spinner fa-spin"), " Simulant Monte Carlo, un moment...")
+  } else if (sim_mode_val() == "none") {
+    div(style="color:#aaa;font-size:12px;padding:6px 0;",
+        "👆 Selecciona els equips i prem un botó per iniciar la simulació.")
+  } else {
+    NULL
+  }
+})
+
+# ==========================================================================
+# PANEL DE RESULTATS DINÀMIC (apareix/canvia segons el mode)
+# ==========================================================================
+output$sim_results_panel <- renderUI({
+  mode <- sim_mode_val()
+  if (mode == "none" || sim_running_val()) return(NULL)
+  
+  if (mode == "single") {
+    single <- sim_single_ind_val()
+    if (is.null(single)) return(NULL)
+    pr <- sim_pr()
+    lu_h <- single$lu_h; lu_a <- single$lu_a
+    home <- single$home; away <- single$away
+    
+    # Scoreboard visual
+    res_txt  <- if (single$score_h > single$score_a) paste0("Victòria ", home)
+    else if (single$score_h < single$score_a) paste0("Victòria ", away)
+    else "Empat"
+    res_col  <- if (single$score_h > single$score_a) "#27ae60"
+    else if (single$score_h < single$score_a) "#e74c3c"
+    else "#f39c12"
+    
+    tagList(
+      # Marcador
+      fluidRow(
+        column(12,
+               div(class="sim-scoreboard",
+                   div(class="sim-teams", paste(home, "vs", away)),
+                   div(class="sim-score",
+                       tags$span(style="color:rgba(255,255,255,.85);", single$score_h),
+                       tags$span(style="font-size:40px;opacity:.5; margin:0 12px;", "-"),
+                       tags$span(style="color:rgba(255,255,255,.85);", single$score_a)),
+                   div(class="sim-status",
+                       tags$span(style=paste0("color:",res_col,";font-weight:900;font-size:14px;"), res_txt),
+                       tags$span(style="opacity:.6; margin: 0 10px;", "·"),
+                       paste0("🟨 ", single$n_yellows_h, "-", single$n_yellows_a,
+                              "  🟥 ", single$n_reds_h, "-", single$n_reds_a))
+               )
+        )
+      ),
+      # Alineacions + Acta
+      fluidRow(
+        column(4,
+               box(width=12, title="📋 Alineacions", solidHeader=TRUE, status="info",
+                   fluidRow(
+                     column(6,
+                            div(class="sim-lineup-col",
+                                tags$h6(home),
+                                lapply(lu_h, function(p) {
+                                  r_val <- pr %>% filter(as.character(player)==p) %>% pull(rating_global)
+                                  r_disp <- if(length(r_val)>0 && is.finite(r_val[1])) round(r_val[1]*100) else "—"
+                                  div(class="sim-lineup-player",
+                                      tags$span(style="font-size:11px;", p),
+                                      tags$span(style="color:#1a6b8a;font-weight:bold;font-size:11px;", paste0("★",r_disp)))
+                                })
+                            )
+                     ),
+                     column(6,
+                            div(class="sim-lineup-col",
+                                tags$h6(away),
+                                lapply(lu_a, function(p) {
+                                  r_val <- pr %>% filter(as.character(player)==p) %>% pull(rating_global)
+                                  r_disp <- if(length(r_val)>0 && is.finite(r_val[1])) round(r_val[1]*100) else "—"
+                                  div(class="sim-lineup-player",
+                                      tags$span(style="font-size:11px;", p),
+                                      tags$span(style="color:#c0392b;font-weight:bold;font-size:11px;", paste0("★",r_disp)))
+                                })
+                            )
+                     )
+                   )
+               )
+        ),
+        column(8,
+               box(width=12, title="📜 Acta del Partit (minut a minut)",
+                   solidHeader=TRUE, status="warning",
+                   uiOutput("sim_single_acta_ui"))
+        )
+      )
+    )
+    
+  } else if (mode == "montecarlo") {
+    sr <- sim_results_val()
+    if (is.null(sr)) return(NULL)
+    
+    tagList(
+      # Scoreboard MC
+      fluidRow(
+        column(12, uiOutput("sim_scoreboard_ui"))
+      ),
+      # Pestanyes de resultats MC
+      fluidRow(
+        column(12,
+               tabBox(width=12,
+                      tabPanel("🎲 Probabilitats",
+                               br(),
+                               uiOutput("sim_prob_bar_ui"),
+                               br(),
+                               plotlyOutput("sim_prob_plot", height="240px")
+                      ),
+                      tabPanel("🗺️ Mapa de Marcadors",
+                               br(),
+                               plotlyOutput("sim_heatmap", height="380px")
+                      ),
+                      tabPanel("⚽ Gols",
+                               br(),
+                               plotlyOutput("sim_goals_dist", height="340px")
+                      ),
+                      tabPanel("📜 Acta exemple",
+                               br(),
+                               uiOutput("sim_acta_ui")
+                      ),
+                      tabPanel("📋 Alineacions",
+                               br(),
+                               uiOutput("sim_lineups_ui")
+                      )
+               )
+        )
+      )
+    )
+  }
+})
+
+output$sim_lineups_ui <- renderUI({
+  req(input$sim_home, input$sim_away)
+  pr <- sim_pr()
+  lu_h <- get_lineup_fn(input$sim_home, pr, 11)
+  lu_a <- get_lineup_fn(input$sim_away, pr, 11)
+  make_player_row <- function(p, team_name) {
+    r_val <- pr %>% filter(as.character(player)==p) %>% pull(rating_global)
+    r_disp <- if(length(r_val)>0) round(r_val[1]*100) else "—"
+    div(class="sim-lineup-player",
+        tags$span(p),
+        tags$span(style="color:#1a6b8a;font-weight:bold;", paste0("★",r_disp)))
+  }
+  fluidRow(
+    column(6,
+           div(class="sim-lineup-col",
+               tags$h6(input$sim_home),
+               if(length(lu_h)==0) p(style="color:#aaa;font-size:11px;","Sense dades")
+               else lapply(lu_h, function(p) make_player_row(p, input$sim_home)))),
+    column(6,
+           div(class="sim-lineup-col",
+               tags$h6(input$sim_away),
+               if(length(lu_a)==0) p(style="color:#aaa;font-size:11px;","Sense dades")
+               else lapply(lu_a, function(p) make_player_row(p, input$sim_away))))
+  )
+})
+
+output$sim_scoreboard_ui <- renderUI({
+  sr <- sim_results_val()
+  if (is.null(sr)) {
+    return(div(class="sim-scoreboard",
+               div(class="sim-teams","Selecciona equips i simula"),
+               div(class="sim-score","— : —"),
+               div(class="sim-status","Resultat esperat (gols promig)")))
+  }
+  df <- sr$df
+  avg_h <- round(mean(df$score_h), 2); avg_a <- round(mean(df$score_a), 2)
+  # Resultat modal
+  res_counts <- table(paste0(df$score_h,"-",df$score_a))
+  modal_score <- names(which.max(res_counts))
+  modal_freq  <- round(max(res_counts)/nrow(df)*100, 1)
+  div(class="sim-scoreboard",
+      div(class="sim-teams", paste(sr$home, "vs", sr$away)),
+      div(class="sim-score", paste0(avg_h, " : ", avg_a)),
+      div(class="sim-status",
+          paste0("Marcador esperat (promig) · ",
+                 "Resultat més probable: ", modal_score, " (", modal_freq, "%)"))
+  )
+})
+
+output$sim_prob_bar_ui <- renderUI({
+  sr <- sim_results_val()
+  if (is.null(sr)) return(NULL)
+  df <- sr$df; n <- nrow(df)
+  ph <- round(sum(df$result=="H")/n*100, 1)
+  pd <- round(sum(df$result=="D")/n*100, 1)
+  pa <- round(sum(df$result=="A")/n*100, 1)
+  div(
+    div(style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px;",
+        tags$span(style="color:#27ae60;font-weight:bold;", sr$home),
+        tags$span(style="color:#888;", "Empat"),
+        tags$span(style="color:#e74c3c;font-weight:bold;", sr$away)),
+    div(class="sim-prob-bar",
+        div(class="sim-prob-h", style=paste0("width:",ph,"%;"), paste0(ph,"%")),
+        div(class="sim-prob-d", style=paste0("width:",pd,"%;"), paste0(pd,"%")),
+        div(class="sim-prob-a", style=paste0("width:",pa,"%;"), paste0(pa,"%")))
+  )
+})
+
+output$sim_prob_plot <- renderPlotly({
+  sr <- sim_results_val()
+  if (is.null(sr)) return(plotly_empty())
+  df <- sr$df; n <- nrow(df)
+  res_df <- data.frame(
+    Resultat = c(paste0("Victoria\n",sr$home), "Empat", paste0("Victoria\n",sr$away)),
+    Prob     = c(sum(df$result=="H")/n, sum(df$result=="D")/n, sum(df$result=="A")/n),
+    Color    = c("#27ae60","#f39c12","#e74c3c"),
+    stringsAsFactors = FALSE
+  )
+  plot_ly(res_df, x=~Resultat, y=~Prob, type="bar",
+          marker=list(color=~Color, line=list(color="white",width=1)),
+          text=~paste0(round(Prob*100,1),"%"), textposition="outside",
+          hovertemplate="%{x}: %{text}<extra></extra>",
+          showlegend=FALSE) %>%
+    layout(yaxis=list(title="Probabilitat", tickformat=".0%", range=c(0,1)),
+           xaxis=list(title=""),
+           plot_bgcolor="#fafafa", paper_bgcolor="white",
+           margin=list(t=20,b=10,l=60,r=20))
+})
+
+output$sim_heatmap <- renderPlotly({
+  sr <- sim_results_val()
+  if (is.null(sr)) return(plotly_empty())
+  df <- sr$df; n_total <- nrow(df)
+  max_g <- min(max(max(df$score_h), max(df$score_a)), 6)
+  counts_df <- df %>% count(score_h, score_a)   # columna 'n'
+  score_mat <- expand.grid(score_h=0:max_g, score_a=0:max_g) %>%
+    left_join(counts_df, by=c("score_h","score_a")) %>%
+    mutate(n=replace_na(n, 0L),
+           prob=n/n_total,
+           label=paste0(round(prob*100,1),"%"))
+  plot_ly(score_mat, x=~score_a, y=~score_h, z=~prob, type="heatmap",
+          colorscale=list(c(0,"white"),c(1,"darkgreen")),
+          text=~label, hovertemplate=paste0(sr$home," %{y} - %{x} ",sr$away,"<br>%{text}<extra></extra>"),
+          showscale=FALSE) %>%
+    add_annotations(x=~score_a, y=~score_h, text=~label,
+                    showarrow=FALSE, font=list(size=10, color="#333")) %>%
+    layout(xaxis=list(title=paste("Gols",sr$away), dtick=1),
+           yaxis=list(title=paste("Gols",sr$home), dtick=1),
+           plot_bgcolor="#fafafa", paper_bgcolor="white",
+           margin=list(t=10,b=50,l=60,r=10))
+})
+
+output$sim_goals_dist <- renderPlotly({
+  sr <- sim_results_val()
+  if (is.null(sr)) return(plotly_empty())
+  df <- sr$df
+  avg_g <- round(mean(df$n_goals), 2)
+  goal_counts <- df %>% count(n_goals) %>% mutate(prob=n/nrow(df))
+  plot_ly(goal_counts, x=~n_goals, y=~prob, type="bar",
+          marker=list(color="#3498db", opacity=0.85, line=list(color="white",width=1)),
+          text=~paste0(round(prob*100,1),"%"), textposition="outside",
+          hovertemplate="Gols %{x}: %{text}<extra></extra>",
+          showlegend=FALSE) %>%
+    add_lines(x=~n_goals, y=avg_g/max(goal_counts$n_goals+1),
+              line=list(color="#e74c3c",width=2,dash="dash"),
+              hoverinfo="none", showlegend=FALSE) %>%
+    layout(xaxis=list(title="Gols totals al partit", dtick=1),
+           yaxis=list(title="Probabilitat", tickformat=".0%"),
+           annotations=list(list(x=avg_g, y=max(goal_counts$prob)*0.95,
+                                 text=paste0("⌀ ",avg_g," gols"),
+                                 showarrow=FALSE, font=list(size=11,color="#e74c3c"),
+                                 bgcolor="rgba(255,255,255,0.8)")),
+           plot_bgcolor="#fafafa", paper_bgcolor="white",
+           margin=list(t=20,b=50,l=60,r=20))
+})
+
+output$sim_acta_ui <- renderUI({
+  single <- sim_single_val()
+  sr     <- sim_results_val()
+  if (is.null(single) || is.null(sr)) {
+    return(div(style="color:#aaa;padding:20px;text-align:center;","Executa la simulació per veure l'acta d'un partit exemple"))
+  }
+  evts <- single$events
+  home <- sr$home; away <- sr$away
+  
+  # Capçalera del resultat
+  header <- div(style="text-align:center;margin-bottom:12px;",
+                div(style="font-size:24px;font-weight:900;color:#1a3a6b;",
+                    paste0(home, "  ", single$score_h, " - ", single$score_a, "  ", away)),
+                div(style="font-size:12px;color:#888;margin-top:4px;",
+                    paste0("Targetes grogues: ",single$n_yellows_h," - ",single$n_yellows_a,
+                           "  ·  Vermelles: ",single$n_reds_h," - ",single$n_reds_a)))
+  
+  # Esdeveniments ordenats per minut
+  if (length(evts) == 0) {
+    return(tagList(header, div(style="color:#aaa;text-align:center;","Sense esdeveniments")))
+  }
+  
+  evt_items <- lapply(evts, function(e) {
+    cls <- switch(e$type,
+                  "gol_h"      = "gol-h",
+                  "gol_a"      = "gol-a",
+                  "groga_h"    = , "groga_a"    = "groga",
+                  "vermella_h" = , "vermella_a" = "vermella",
+                  "canvi_h"    = , "canvi_a"    = "canvi",
+                  "canvi")
+    
+    icon_txt <- switch(e$type,
+                       "gol_h"="⚽", "gol_a"="⚽",
+                       "groga_h"="🟨", "groga_a"="🟨",
+                       "vermella_h"="🟥", "vermella_a"="🟥",
+                       "canvi_h"="🔄", "canvi_a"="🔄", "❓")
+    
+    team_lbl <- if (!is.null(e$team)) e$team else ""
+    player_lbl <- if (!is.null(e$player)) e$player else ""
+    score_lbl  <- if (!is.null(e$score))  paste0(" [",e$score,"]") else ""
+    
+    detail <- if (e$type %in% c("canvi_h","canvi_a"))
+      paste0("⬆ ", e$inn, "  ⬇ ", e$out)
+    else
+      paste0(player_lbl, score_lbl)
+    
+    div(class=paste0("sim-event ", cls),
+        tags$span(class="sim-min", paste0(e$minute,"'")),
+        tags$span(icon_txt),
+        tags$span(style="font-size:11px;color:#888;", team_lbl),
+        tags$span(style="font-weight:600;", detail))
+  })
+  
+  # Dividir entre primera i segona part
+  is_first_half <- function(e) e$minute <= 45
+  first_half  <- Filter(is_first_half, evts)
+  second_half <- Filter(Negate(is_first_half), evts)
+  
+  first_items  <- lapply(first_half, function(e) {
+    cls <- switch(e$type,"gol_h"="gol-h","gol_a"="gol-a","groga_h"=,"groga_a"="groga","vermella_h"=,"vermella_a"="vermella","canvi")
+    icon_txt <- switch(e$type,"gol_h"="⚽","gol_a"="⚽","groga_h"="🟨","groga_a"="🟨","vermella_h"="🟥","vermella_a"="🟥","canvi_h"="🔄","canvi_a"="🔄","❓")
+    team_lbl  <- if (!is.null(e$team)) e$team else ""
+    detail    <- if (e$type %in% c("canvi_h","canvi_a")) paste0("⬆ ",e$inn,"  ⬇ ",e$out) else paste0(if(!is.null(e$player))e$player else "", if(!is.null(e$score))paste0(" [",e$score,"]") else "")
+    div(class=paste0("sim-event ",cls),tags$span(class="sim-min",paste0(e$minute,"'")),tags$span(icon_txt),tags$span(style="font-size:11px;color:#888;",team_lbl),tags$span(style="font-weight:600;",detail))
+  })
+  second_items <- lapply(second_half, function(e) {
+    cls <- switch(e$type,"gol_h"="gol-h","gol_a"="gol-a","groga_h"=,"groga_a"="groga","vermella_h"=,"vermella_a"="vermella","canvi")
+    icon_txt <- switch(e$type,"gol_h"="⚽","gol_a"="⚽","groga_h"="🟨","groga_a"="🟨","vermella_h"="🟥","vermella_a"="🟥","canvi_h"="🔄","canvi_a"="🔄","❓")
+    team_lbl  <- if (!is.null(e$team)) e$team else ""
+    detail    <- if (e$type %in% c("canvi_h","canvi_a")) paste0("⬆ ",e$inn,"  ⬇ ",e$out) else paste0(if(!is.null(e$player))e$player else "", if(!is.null(e$score))paste0(" [",e$score,"]") else "")
+    div(class=paste0("sim-event ",cls),tags$span(class="sim-min",paste0(e$minute,"'")),tags$span(icon_txt),tags$span(style="font-size:11px;color:#888;",team_lbl),tags$span(style="font-weight:600;",detail))
+  })
+  
+  tagList(
+    header,
+    fluidRow(
+      column(6,
+             div(tags$b(style="font-size:12px;color:#555;display:block;margin-bottom:8px;","⏱ PRIMERA PART"),
+                 if(length(first_items)==0) div(style="color:#aaa;font-size:12px;padding:8px;","Sense esdeveniments")
+                 else first_items)),
+      column(6,
+             div(tags$b(style="font-size:12px;color:#555;display:block;margin-bottom:8px;","⏱ SEGONA PART"),
+                 if(length(second_items)==0) div(style="color:#aaa;font-size:12px;padding:8px;","Sense esdeveniments")
+                 else second_items))
+    )
+  )
+})
+
+# Helper per renderitzar acta d'un single match genèric
+render_acta_from_single <- function(single, home, away) {
+  if (is.null(single)) return(div(style="color:#aaa;padding:16px;text-align:center;","Prem ⚡ Simular 1 Partit per veure l'acta minut a minut"))
+  evts <- single$events
+  header <- div(style="text-align:center;margin-bottom:14px;",
+                div(style="font-size:26px;font-weight:900;color:#1a3a6b;",
+                    paste0(home,"  ",single$score_h," - ",single$score_a,"  ",away)),
+                div(style="font-size:12px;color:#888;margin-top:4px;",
+                    paste0("Grogues: ",single$n_yellows_h," - ",single$n_yellows_a,
+                           "  ·  Vermelles: ",single$n_reds_h," - ",single$n_reds_a,
+                           "  ·  Canvis: ",single$n_reds_h + sum(sapply(evts, function(e) e$type %in% c("canvi_h","canvi_a")))," - ",0)))
+  make_evt_div <- function(e) {
+    cls <- switch(e$type, "gol_h"="gol-h","gol_a"="gol-a",
+                  "groga_h"=,"groga_a"="groga",
+                  "vermella_h"=,"vermella_a"="vermella","canvi")
+    icon_txt <- switch(e$type,"gol_h"="⚽","gol_a"="⚽",
+                       "groga_h"="🟨","groga_a"="🟨",
+                       "vermella_h"="🟥","vermella_a"="🟥",
+                       "canvi_h"="🔄","canvi_a"="🔄","❓")
+    team_lbl <- if (!is.null(e$team)) e$team else ""
+    detail <- if (e$type %in% c("canvi_h","canvi_a"))
+      paste0("⬆ ",e$inn,"  ⬇ ",e$out)
+    else
+      paste0(if(!is.null(e$player)) e$player else "",
+             if(!is.null(e$score)) paste0("  [",e$score,"]") else "")
+    div(class=paste0("sim-event ",cls),
+        tags$span(class="sim-min", paste0(e$minute,"'")),
+        tags$span(icon_txt),
+        tags$span(style="font-size:11px;color:#888;min-width:120px;display:inline-block;", team_lbl),
+        tags$span(style="font-weight:600;", detail))
+  }
+  if (length(evts) == 0) return(tagList(header, div(style="color:#aaa;text-align:center;padding:12px;","Sense esdeveniments destacats")))
+  first_half  <- Filter(function(e) e$minute <= 45, evts)
+  second_half <- Filter(function(e) e$minute > 45,  evts)
+  tagList(
+    header,
+    fluidRow(
+      column(6,
+             tags$b(style="font-size:12px;color:#555;display:block;margin-bottom:8px;","⏱ PRIMERA PART (1'-45')"),
+             if(length(first_half)==0) div(style="color:#aaa;font-size:12px;padding:8px;","Sense esdeveniments")
+             else lapply(first_half, make_evt_div)),
+      column(6,
+             tags$b(style="font-size:12px;color:#555;display:block;margin-bottom:8px;","⏱ SEGONA PART (46'-90')"),
+             if(length(second_half)==0) div(style="color:#aaa;font-size:12px;padding:8px;","Sense esdeveniments")
+             else lapply(second_half, make_evt_div))
+    )
+  )
+}
+
+output$sim_single_acta_ui <- renderUI({
+  single <- sim_single_ind_val()
+  if (is.null(single)) {
+    return(div(style="color:#aaa;padding:16px;text-align:center;",
+               "Prem ⚡ Simular 1 Partit per veure l'acta minut a minut"))
+  }
+  render_acta_from_single(single, single$home, single$away)
 })
 }
 
