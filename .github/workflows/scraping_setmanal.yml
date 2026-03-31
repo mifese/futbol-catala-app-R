@@ -2,32 +2,68 @@ name: Scraping Setmanal FCF
 
 on:
   schedule:
-    # Cada dilluns a les 08:00 UTC (10:00 hora catalana)
-    - cron: "0 8 * * 1"
-  workflow_dispatch:  # també permet executar manualment des de GitHub
+    # Cada dilluns a les 06:00 UTC (08:00 hora catalana)
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      categoria:
+        description: "Categoria a processar (buida = totes)"
+        required: false
+        default: ""
+      grup:
+        description: "Grup concret (buida = tots)"
+        required: false
+        default: ""
+
+env:
+  # Activar Node.js 24 per evitar el warning de deprecació
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   scraping:
     runs-on: ubuntu-latest
+    timeout-minutes: 340  # màxim 5h 40min (GitHub permet 6h)
 
     steps:
       - name: Checkout del repositori
         uses: actions/checkout@v4
 
-      - name: Configurar Python
+      - name: Configurar Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Instal·lar dependències
         run: pip install -r requirements.txt
 
       - name: Executar scraper
-        run: python scraper.py --output dades
+        run: |
+          if [ -n "${{ github.event.inputs.categoria }}" ] && [ -n "${{ github.event.inputs.grup }}" ]; then
+            echo "▶️  Processant: ${{ github.event.inputs.categoria }} Grup ${{ github.event.inputs.grup }}"
+            python scraper.py --categoria ${{ github.event.inputs.categoria }} --grup ${{ github.event.inputs.grup }}
+          elif [ -n "${{ github.event.inputs.categoria }}" ]; then
+            echo "▶️  Processant categoria: ${{ github.event.inputs.categoria }}"
+            python scraper.py --categoria ${{ github.event.inputs.categoria }}
+          else
+            echo "▶️  Processant totes les categories"
+            python scraper.py
+          fi
 
-      - name: Pujar CSVs com a artefacte (backup)
+      - name: Pujar CSVs consolidats com a artefacte
+        if: always()  # pujar fins i tot si hi ha errors parcials
         uses: actions/upload-artifact@v4
         with:
-          name: dades-${{ github.run_number }}
+          name: dades-consolidades-${{ github.run_number }}
           path: dades/consolidat_*.csv
-          retention-days: 30
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Resum del scraping
+        if: always()
+        run: |
+          echo "## Fitxers generats" >> $GITHUB_STEP_SUMMARY
+          find dades/ -name "*.csv" | sort | while read f; do
+            lines=$(wc -l < "$f")
+            echo "- \`$f\`: $((lines-1)) registres" >> $GITHUB_STEP_SUMMARY
+          done

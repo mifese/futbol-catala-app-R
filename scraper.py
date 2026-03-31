@@ -29,7 +29,9 @@ warnings.filterwarnings("ignore")
 TEMPORADA     = "25_26"
 TEMPORADA_FCF = "2526"
 HEADERS       = {"User-Agent": "Mozilla/5.0"}
-SLEEP_BETWEEN_REQUESTS = 0.8  # segons entre peticions (respecta el servidor)
+SLEEP_BETWEEN_REQUESTS = 2.5  # segons entre peticions (respecta el servidor)
+MAX_RETRIES            = 4    # intents en cas de 503
+RETRY_BACKOFF          = 30   # segons d'espera base entre reintents (es dobla cada vegada)
 
 # Nombre de jornades per categoria
 MAX_JORNADES = {
@@ -78,14 +80,30 @@ def normalize_team_name(team_name: str) -> str:
 
 
 def get(url: str) -> BeautifulSoup | None:
-    """Petició HTTP amb gestió d'errors. Retorna BeautifulSoup o None."""
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-        return BeautifulSoup(resp.text, "lxml")
-    except Exception as e:
-        print(f"    ⚠️  Error GET {url}: {e}")
-        return None
+    """Petició HTTP amb retry automàtic i backoff exponencial en cas de 503."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=20)
+            if resp.status_code == 503:
+                wait = RETRY_BACKOFF * (2 ** (attempt - 1))
+                print(f"    ⏳ 503 rebut (intent {attempt}/{MAX_RETRIES}), esperant {wait}s...")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return BeautifulSoup(resp.text, "lxml")
+        except requests.exceptions.HTTPError as e:
+            if attempt < MAX_RETRIES:
+                wait = RETRY_BACKOFF * (2 ** (attempt - 1))
+                print(f"    ⏳ Error HTTP (intent {attempt}/{MAX_RETRIES}), esperant {wait}s...")
+                time.sleep(wait)
+            else:
+                print(f"    ❌ Error GET {url}: {e}")
+                return None
+        except Exception as e:
+            print(f"    ❌ Error GET {url}: {e}")
+            return None
+    print(f"    ❌ Exhaurits {MAX_RETRIES} intents per: {url}")
+    return None
 
 
 # ============================================================================
@@ -585,6 +603,9 @@ def process_grup(categoria: str, grup: int, output_dir: Path):
     print("  1/6 Scraping partits...")
     df_matches = scrape_matches(categoria, grup)
     df_matches.to_csv(output_dir / "matches.csv", index=False)
+    if df_matches.empty or "goals_home" not in df_matches.columns:
+        print(f"     ⚠️  Cap partit obtingut per {categoria} Grup {grup} — saltant")
+        return False
     print(f"     ✅ {len(df_matches)} partits ({df_matches['goals_home'].notna().sum()} jugats)")
 
     # 2. Classificació per jornada
