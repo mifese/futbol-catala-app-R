@@ -727,9 +727,17 @@ def main():
                         help="Processa només aquest grup (requereix --categoria)")
     parser.add_argument("--output", default="dades",
                         help="Directori de sortida base (default: dades/)")
+    parser.add_argument("--only-consolidar", action="store_true",
+                        help="Només fa la consolidació final sense scraping")
     args = parser.parse_args()
 
     base_output = Path(args.output)
+
+    # Mode només consolidació (usat pel job de GitHub Actions)
+    if args.only_consolidar:
+        consolidar_tot(base_output, base_output)
+        print("\n🎉 Consolidació completada!")
+        return
 
     if args.categoria and args.grup:
         # Un sol grup
