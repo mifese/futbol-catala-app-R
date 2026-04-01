@@ -615,9 +615,50 @@ def get_supabase_client() -> Client | None:
     return create_client(url, key)
 
 
+def to_python_native(val, force_int: bool = False):
+    """Converteix qualsevol valor numpy/pandas a tipus Python natiu o None."""
+    if val is None:
+        return None
+    # Capturar NaN tant de Python float com de numpy
+    if isinstance(val, (float, np.floating)) and np.isnan(val):
+        return None
+    # numpy integers → int Python
+    if isinstance(val, (np.integer,)):
+        return int(val)
+    # numpy floats → int o float Python
+    if isinstance(val, (np.floating,)):
+        return int(val) if force_int else float(val)
+    # Python float normal → int o float
+    if isinstance(val, float):
+        return int(val) if force_int else val
+    # numpy bool → bool Python
+    if isinstance(val, (np.bool_,)):
+        return bool(val)
+    return val
+
+
 def upload_grup_to_supabase(client: Client, categoria: str, grup: int, output_dir: Path):
     """Puja els CSVs d'un grup a Supabase: esborra els registres anteriors i insereix els nous."""
     print(f"  ☁️  Pujant {categoria} Grup {grup} a Supabase...")
+
+    # Columnes vàlides per cada taula (han de coincidir exactament amb l'esquema SQL)
+    COLS_SCHEMA = {
+        "matches":           ["categoria","grup","season","competition","jornada","local_team","away_team","goals_home","goals_away","venue"],
+        "matches_info":      ["categoria","grup","season","competition","jornada","date","time","home_team","away_team","goals_home","goals_away","referee"],
+        "matches_events":    ["categoria","grup","match_date","jornada","home_team","away_team","event_type","minute","team","player","detail"],
+        "matches_lineups":   ["categoria","grup","match_date","jornada","home_team","away_team","team","player","shirt_number","position","stats"],
+        "player_match_stats":["categoria","grup","match_id","jornada","match_date","player","team","starter","minutes_played","goals","yellow_cards","red_cards"],
+        "player_stats":      ["categoria","grup","player","team","matches_played","starts","total_minutes","goals","goals_per_90","cards_per_90"],
+        "standings_by_round":["categoria","grup","team","jornada","position","played","wins","draws","losses","goals_for","goals_against","goal_diff","points"],
+        "team_match_stats":  ["categoria","grup","team","match_id","jornada","match_date","opponent","home_away","goals_for","goals_against","yellow_cards","red_cards"],
+    }
+
+    # Columnes que han de ser int pur (sense nuls) i les que poden ser NULL
+    INT_NONNULL = {"jornada","grup","goals_home","goals_away","goals_for","goals_against",
+                   "goal_diff","points","played","wins","draws","losses","position",
+                   "starter","minutes_played","goals","yellow_cards","red_cards",
+                   "starts","total_minutes","matches_played","shirt_number"}
+    INT_NULLABLE = {"minute"}
 
     for csv_name, table_name in CSV_TABLE_MAP.items():
         csv_path = output_dir / csv_name
@@ -630,48 +671,46 @@ def upload_grup_to_supabase(client: Client, categoria: str, grup: int, output_di
             print(f"    ⚠️  {csv_name} buit, saltant")
             continue
 
-        # Assegurar que categoria i grup hi són (per si de cas)
+        # Assegurar categoria i grup
         if "categoria" not in df.columns:
             df["categoria"] = categoria
         if "grup" not in df.columns:
             df["grup"] = grup
 
-        # Eliminar columnes que no existeixen a l'esquema de Supabase
-        COLS_SCHEMA = {
-            "matches":           ["categoria","grup","season","competition","jornada","local_team","away_team","goals_home","goals_away","venue"],
-            "matches_info":      ["categoria","grup","season","competition","jornada","date","time","home_team","away_team","goals_home","goals_away","referee"],
-            "matches_events":    ["categoria","grup","match_date","jornada","home_team","away_team","event_type","minute","team","player","detail"],
-            "matches_lineups":   ["categoria","grup","match_date","jornada","home_team","away_team","team","player","shirt_number","position","stats"],
-            "player_match_stats":["categoria","grup","match_id","jornada","match_date","player","team","starter","minutes_played","goals","yellow_cards","red_cards"],
-            "player_stats":      ["categoria","grup","player","team","matches_played","starts","total_minutes","goals","goals_per_90","cards_per_90"],
-            "standings_by_round":["categoria","grup","team","jornada","position","played","wins","draws","losses","goals_for","goals_against","goal_diff","points"],
-            "team_match_stats":  ["categoria","grup","team","match_id","jornada","match_date","opponent","home_away","goals_for","goals_against","yellow_cards","red_cards"],
-        }
+        # Seleccionar només columnes de l'esquema
         valid_cols = COLS_SCHEMA.get(table_name, list(df.columns))
-        df = df[[c for c in valid_cols if c in df.columns]]
+        df = df[[c for c in valid_cols if c in df.columns]].copy()
 
-        # Convertir columnes numèriques de float a int on calgui (goals_home, goals_away, etc.)
-        int_cols = ["jornada","grup","goals_home","goals_away","goals_for","goals_against",
-                    "goal_diff","points","played","wins","draws","losses","position",
-                    "starter","minutes_played","goals","yellow_cards","red_cards",
-                    "minute","starts","total_minutes","matches_played"]
-        for col in int_cols:
+        # Pre-convertir columnes numèriques
+        for col in INT_NONNULL:
             if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+        for col in INT_NULLABLE:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        # Netejar NaN → None (Supabase no accepta NaN)
-        df = df.where(pd.notna(df), other=None)
+        # Construir records amb tipus Python natius purs (sense numpy)
+        records = []
+        for row in df.to_dict(orient="records"):
+            clean = {}
+            for k, v in row.items():
+                if k in INT_NONNULL:
+                    clean[k] = int(to_python_native(v, force_int=True) or 0)
+                elif k in INT_NULLABLE:
+                    native = to_python_native(v, force_int=True)
+                    clean[k] = native  # pot ser None
+                else:
+                    clean[k] = to_python_native(v)
+            records.append(clean)
 
         try:
-            # 1. Esborrar registres anteriors d'aquest grup
+            # Esborrar registres anteriors d'aquest grup
             client.table(table_name).delete().eq("categoria", categoria).eq("grup", grup).execute()
 
-            # 2. Inserir en blocs de 500 (límit recomanat per Supabase)
-            records = df.to_dict(orient="records")
+            # Inserir en blocs de 500
             chunk_size = 500
             for i in range(0, len(records), chunk_size):
-                chunk = records[i:i + chunk_size]
-                client.table(table_name).insert(chunk).execute()
+                client.table(table_name).insert(records[i:i + chunk_size]).execute()
 
             print(f"    ✅ {table_name}: {len(records)} registres pujats")
 
@@ -742,16 +781,19 @@ def process_grup(categoria: str, grup: int, output_dir: Path):
         df_events.sort_values(["jornada", "minute"], na_position="last", inplace=True)
 
     # Afegir categoria i grup als DataFrames abans de guardar
-    for df_temp in [df_match_info, df_events, df_lineups]:
-        if not df_temp.empty:
-            if "categoria" not in df_temp.columns:
-                df_temp.insert(0, "categoria", categoria)
-            if "grup" not in df_temp.columns:
-                df_temp.insert(1, "grup", grup)
-
-    df_match_info.to_csv(output_dir / "all_matches_info.csv",    index=False)
-    df_events.to_csv(    output_dir / "all_matches_events.csv",  index=False)
-    df_lineups.to_csv(   output_dir / "all_matches_lineups.csv", index=False)
+    # IMPORTANT: cal fer-ho explícitament per cada DataFrame (no amb un bucle
+    # perquè reassignar df_temp no modifica l'original)
+    for df_ref, path in [
+        (df_match_info, output_dir / "all_matches_info.csv"),
+        (df_events,     output_dir / "all_matches_events.csv"),
+        (df_lineups,    output_dir / "all_matches_lineups.csv"),
+    ]:
+        if not df_ref.empty:
+            if "categoria" not in df_ref.columns:
+                df_ref.insert(0, "categoria", categoria)
+            if "grup" not in df_ref.columns:
+                df_ref.insert(1, "grup", grup)
+        df_ref.to_csv(path, index=False)
     print(f"     ✅ {ok} actes OK / ❌ {err} errors")
 
     # 4. Estadístiques de jugadors per partit
