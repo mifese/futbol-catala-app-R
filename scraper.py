@@ -631,11 +631,11 @@ def upload_grup_to_supabase(client: Client, categoria: str, grup: int, output_di
             print(f"    ⚠️  {csv_name} buit, saltant")
             continue
 
-        # Afegir categoria i grup si no hi són
+        # Assegurar que categoria i grup hi són (per si de cas)
         if "categoria" not in df.columns:
-            df.insert(0, "categoria", categoria)
+            df["categoria"] = categoria
         if "grup" not in df.columns:
-            df.insert(1, "grup", grup)
+            df["grup"] = grup
 
         # Netejar NaN → None (Supabase no accepta NaN)
         df = df.where(pd.notna(df), other=None)
@@ -670,6 +670,11 @@ def process_grup(categoria: str, grup: int, output_dir: Path):
     # 1. Partits
     print("  1/6 Scraping partits...")
     df_matches = scrape_matches(categoria, grup)
+    if not df_matches.empty:
+        if "categoria" not in df_matches.columns:
+            df_matches.insert(0, "categoria", categoria)
+        if "grup" not in df_matches.columns:
+            df_matches.insert(1, "grup", grup)
     df_matches.to_csv(output_dir / "matches.csv", index=False)
     if df_matches.empty or "goals_home" not in df_matches.columns:
         print(f"     ⚠️  Cap partit obtingut per {categoria} Grup {grup} — saltant")
@@ -713,6 +718,14 @@ def process_grup(categoria: str, grup: int, output_dir: Path):
 
     if not df_events.empty:
         df_events.sort_values(["jornada", "minute"], na_position="last", inplace=True)
+
+    # Afegir categoria i grup als DataFrames abans de guardar
+    for df_temp in [df_match_info, df_events, df_lineups]:
+        if not df_temp.empty:
+            if "categoria" not in df_temp.columns:
+                df_temp.insert(0, "categoria", categoria)
+            if "grup" not in df_temp.columns:
+                df_temp.insert(1, "grup", grup)
 
     df_match_info.to_csv(output_dir / "all_matches_info.csv",    index=False)
     df_events.to_csv(    output_dir / "all_matches_events.csv",  index=False)
