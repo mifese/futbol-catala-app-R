@@ -159,7 +159,6 @@ def scrape_matches(categoria: str, grup: int) -> pd.DataFrame:
                 matches.append({
                     "season":      "2025-2026",
                     "competition": f"{categoria.capitalize()} Catalana",
-                    "group":       grup,
                     "jornada":     jornada_num,
                     "local_team":  local,
                     "away_team":   away,
@@ -636,6 +635,29 @@ def upload_grup_to_supabase(client: Client, categoria: str, grup: int, output_di
             df["categoria"] = categoria
         if "grup" not in df.columns:
             df["grup"] = grup
+
+        # Eliminar columnes que no existeixen a l'esquema de Supabase
+        COLS_SCHEMA = {
+            "matches":           ["categoria","grup","season","competition","jornada","local_team","away_team","goals_home","goals_away","venue"],
+            "matches_info":      ["categoria","grup","season","competition","jornada","date","time","home_team","away_team","goals_home","goals_away","referee"],
+            "matches_events":    ["categoria","grup","match_date","jornada","home_team","away_team","event_type","minute","team","player","detail"],
+            "matches_lineups":   ["categoria","grup","match_date","jornada","home_team","away_team","team","player","shirt_number","position","stats"],
+            "player_match_stats":["categoria","grup","match_id","jornada","match_date","player","team","starter","minutes_played","goals","yellow_cards","red_cards"],
+            "player_stats":      ["categoria","grup","player","team","matches_played","starts","total_minutes","goals","goals_per_90","cards_per_90"],
+            "standings_by_round":["categoria","grup","team","jornada","position","played","wins","draws","losses","goals_for","goals_against","goal_diff","points"],
+            "team_match_stats":  ["categoria","grup","team","match_id","jornada","match_date","opponent","home_away","goals_for","goals_against","yellow_cards","red_cards"],
+        }
+        valid_cols = COLS_SCHEMA.get(table_name, list(df.columns))
+        df = df[[c for c in valid_cols if c in df.columns]]
+
+        # Convertir columnes numèriques de float a int on calgui (goals_home, goals_away, etc.)
+        int_cols = ["jornada","grup","goals_home","goals_away","goals_for","goals_against",
+                    "goal_diff","points","played","wins","draws","losses","position",
+                    "starter","minutes_played","goals","yellow_cards","red_cards",
+                    "minute","starts","total_minutes","matches_played"]
+        for col in int_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
 
         # Netejar NaN → None (Supabase no accepta NaN)
         df = df.where(pd.notna(df), other=None)

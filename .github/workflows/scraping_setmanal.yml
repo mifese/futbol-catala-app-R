@@ -132,12 +132,13 @@ jobs:
 
   # ============================================================
   # JOB D: Consolidació — s'executa quan els 3 jobs anteriors acaben
+  # No peta si algun job no ha corregut (execució parcial per categoria)
   # ============================================================
   consolidar:
     name: "Consolidació final"
     runs-on: ubuntu-latest
     needs: [tercera, segona, primera]
-    if: always()  # executa fins i tot si algun job ha fallat parcialment
+    if: always()
 
     steps:
       - uses: actions/checkout@v4
@@ -168,8 +169,14 @@ jobs:
           path: dades/PRIMERA/
         continue-on-error: true
 
-      - name: Consolidar tots els grups
-        run: python scraper.py --only-consolidar
+      - name: Consolidar els grups disponibles
+        run: |
+          # Comprovem si hi ha alguna dada descarregada abans de consolidar
+          if find dades/ -name "matches.csv" | grep -q .; then
+            python scraper.py --only-consolidar
+          else
+            echo "⚠️ Cap dada disponible per consolidar en aquesta execució"
+          fi
 
       - name: Pujar CSVs consolidats finals
         uses: actions/upload-artifact@v4
@@ -185,8 +192,12 @@ jobs:
           echo "## 📊 Resum del Scraping" >> $GITHUB_STEP_SUMMARY
           echo "| Fitxer | Registres |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|-----------|" >> $GITHUB_STEP_SUMMARY
-          find dades/ -name "consolidat_*.csv" | sort | while read f; do
-            nom=$(basename "$f")
-            lines=$(($(wc -l < "$f") - 1))
-            echo "| \`$nom\` | $lines |" >> $GITHUB_STEP_SUMMARY
-          done
+          if find dades/ -name "consolidat_*.csv" | grep -q .; then
+            find dades/ -name "consolidat_*.csv" | sort | while read f; do
+              nom=$(basename "$f")
+              lines=$(($(wc -l < "$f") - 1))
+              echo "| \`$nom\` | $lines |" >> $GITHUB_STEP_SUMMARY
+            done
+          else
+            echo "| — | Cap fitxer consolidat generat |" >> $GITHUB_STEP_SUMMARY
+          fi
