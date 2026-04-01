@@ -19,6 +19,7 @@ import argparse
 import warnings
 from pathlib import Path
 from unidecode import unidecode
+from supabase import create_client, Client
 
 warnings.filterwarnings("ignore")
 
@@ -588,6 +589,73 @@ def build_team_match_stats(matches_info: pd.DataFrame,
     return df
 
 
+
+# ============================================================================
+# MÒDUL 5 — UPLOAD A SUPABASE
+# ============================================================================
+
+# Mapa: nom CSV → nom taula Supabase
+CSV_TABLE_MAP = {
+    "matches.csv":            "matches",
+    "all_matches_info.csv":   "matches_info",
+    "all_matches_events.csv": "matches_events",
+    "all_matches_lineups.csv":"matches_lineups",
+    "player_match_stats.csv": "player_match_stats",
+    "player_stats.csv":       "player_stats",
+    "standings_by_round.csv": "standings_by_round",
+    "team_match_stats.csv":   "team_match_stats",
+}
+
+def get_supabase_client() -> Client | None:
+    """Crea client Supabase des de variables d'entorn. Retorna None si no estan configurades."""
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_KEY")
+    if not url or not key:
+        print("  ⚠️  SUPABASE_URL o SUPABASE_KEY no definides — saltant upload")
+        return None
+    return create_client(url, key)
+
+
+def upload_grup_to_supabase(client: Client, categoria: str, grup: int, output_dir: Path):
+    """Puja els CSVs d'un grup a Supabase: esborra els registres anteriors i insereix els nous."""
+    print(f"  ☁️  Pujant {categoria} Grup {grup} a Supabase...")
+
+    for csv_name, table_name in CSV_TABLE_MAP.items():
+        csv_path = output_dir / csv_name
+        if not csv_path.exists():
+            print(f"    ⚠️  {csv_name} no trobat, saltant")
+            continue
+
+        df = pd.read_csv(csv_path)
+        if df.empty:
+            print(f"    ⚠️  {csv_name} buit, saltant")
+            continue
+
+        # Afegir categoria i grup si no hi són
+        if "categoria" not in df.columns:
+            df.insert(0, "categoria", categoria)
+        if "grup" not in df.columns:
+            df.insert(1, "grup", grup)
+
+        # Netejar NaN → None (Supabase no accepta NaN)
+        df = df.where(pd.notna(df), other=None)
+
+        try:
+            # 1. Esborrar registres anteriors d'aquest grup
+            client.table(table_name).delete().eq("categoria", categoria).eq("grup", grup).execute()
+
+            # 2. Inserir en blocs de 500 (límit recomanat per Supabase)
+            records = df.to_dict(orient="records")
+            chunk_size = 500
+            for i in range(0, len(records), chunk_size):
+                chunk = records[i:i + chunk_size]
+                client.table(table_name).insert(chunk).execute()
+
+            print(f"    ✅ {table_name}: {len(records)} registres pujats")
+
+        except Exception as e:
+            print(f"    ❌ Error pujant {table_name}: {e}")
+
 # ============================================================================
 # PIPELINE PRINCIPAL PER UN GRUP
 # ============================================================================
@@ -667,6 +735,12 @@ def process_grup(categoria: str, grup: int, output_dir: Path):
     df_tms.to_csv(output_dir / "team_match_stats.csv", index=False)
 
     print(f"  💾 Fitxers guardats a: {output_dir}")
+
+    # Upload a Supabase (només si les credencials estan disponibles)
+    supabase = get_supabase_client()
+    if supabase:
+        upload_grup_to_supabase(supabase, categoria, grup, output_dir)
+
     return True
 
 

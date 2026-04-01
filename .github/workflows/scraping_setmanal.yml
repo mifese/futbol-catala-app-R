@@ -37,6 +37,9 @@ jobs:
       - run: pip install -r requirements.txt
 
       - name: Scraping Tercera Catalana
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
           if [ -n "${{ github.event.inputs.grup }}" ]; then
             python scraper.py --categoria TERCERA --grup ${{ github.event.inputs.grup }}
@@ -71,6 +74,9 @@ jobs:
       - run: pip install -r requirements.txt
 
       - name: Scraping Segona Catalana
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
           if [ -n "${{ github.event.inputs.grup }}" ]; then
             python scraper.py --categoria SEGONA --grup ${{ github.event.inputs.grup }}
@@ -105,6 +111,9 @@ jobs:
       - run: pip install -r requirements.txt
 
       - name: Scraping Primera Catalana
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
           if [ -n "${{ github.event.inputs.grup }}" ]; then
             python scraper.py --categoria PRIMERA --grup ${{ github.event.inputs.grup }}
