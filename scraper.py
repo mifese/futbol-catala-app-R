@@ -28,8 +28,8 @@ warnings.filterwarnings("ignore")
 # CONFIGURACIÓ CENTRAL — modifica aquí si canvia la temporada o els grups
 # ============================================================================
 
-TEMPORADA     = "25_26"
-TEMPORADA_FCF = "2526"
+TEMPORADA     = "26_27"
+TEMPORADA_FCF = "2627"
 HEADERS       = {"User-Agent": "Mozilla/5.0"}
 SLEEP_BETWEEN_REQUESTS = 2.5  # segons entre peticions (respecta el servidor)
 MAX_RETRIES            = 4    # intents en cas de 503
@@ -158,7 +158,7 @@ def scrape_matches(categoria: str, grup: int) -> pd.DataFrame:
                 camp = camp_a.get_text(strip=True).replace('"', "") if camp_a else None
 
                 matches.append({
-                    "season":      "2025-2026",
+                    "season":      "2026-2027",
                     "competition": f"{categoria.capitalize()} Catalana",
                     "jornada":     jornada_num,
                     "local_team":  local,
