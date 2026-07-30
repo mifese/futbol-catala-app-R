@@ -452,13 +452,43 @@ def scrape_match_acta(home_team: str, away_team: str, jornada_num: int,
 # MÒDUL 4 — ESTADÍSTIQUES DE JUGADORS I EQUIPS
 # ============================================================================
 
+PLAYER_MATCH_STATS_COLUMNS = [
+    "match_id", "jornada", "match_date", "player", "team",
+    "starter", "minutes_played", "goals", "yellow_cards", "red_cards",
+]
+
+EVENTS_EMPTY_COLUMNS = [
+    "match_date", "jornada", "home_team", "away_team",
+    "event_type", "minute", "team", "player", "detail", "match_id",
+]
+
+
 def build_player_match_stats(lineups: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
-    """Construeix player_match_stats a partir de lineups i events."""
-    for df in [lineups, events]:
-        df["match_id"] = (
-            df["jornada"].astype(str) + "_"
-            + df["home_team"].str[:3] + "_"
-            + df["away_team"].str[:3]
+    """Construeix player_match_stats a partir de lineups i events.
+
+    Guarda: a l'inici de temporada (0 partits jugats) `lineups` i/o `events`
+    poden arribar buits i sense columnes (p. ex. `jornada`). En aquest cas
+    retornem directament un DataFrame buit amb l'esquema correcte, en lloc
+    de petar a `df["jornada"].astype(str)`.
+    """
+    if lineups is None or lineups.empty or "jornada" not in lineups.columns:
+        return pd.DataFrame(columns=PLAYER_MATCH_STATS_COLUMNS)
+
+    lineups = lineups.copy()
+    lineups["match_id"] = (
+        lineups["jornada"].astype(str) + "_"
+        + lineups["home_team"].str[:3] + "_"
+        + lineups["away_team"].str[:3]
+    )
+
+    if events is None or events.empty or "jornada" not in events.columns:
+        events = pd.DataFrame(columns=EVENTS_EMPTY_COLUMNS)
+    else:
+        events = events.copy()
+        events["match_id"] = (
+            events["jornada"].astype(str) + "_"
+            + events["home_team"].str[:3] + "_"
+            + events["away_team"].str[:3]
         )
 
     records = []
@@ -522,11 +552,28 @@ def build_player_match_stats(lineups: pd.DataFrame, events: pd.DataFrame) -> pd.
     df = pd.DataFrame(records)
     if not df.empty:
         df.sort_values(["jornada", "team", "starter"], ascending=[True, True, False], inplace=True)
+    else:
+        df = pd.DataFrame(columns=PLAYER_MATCH_STATS_COLUMNS)
     return df
 
 
+PLAYER_STATS_COLUMNS = [
+    "player", "team", "matches_played", "starts", "total_minutes",
+    "goals", "goals_per_90", "cards_per_90",
+]
+
+
 def build_player_stats(player_match_stats: pd.DataFrame) -> pd.DataFrame:
-    """Estadístiques agregades per jugador."""
+    """Estadístiques agregades per jugador.
+
+    Guarda: si `player_match_stats` és buit (0 partits jugats), no té les
+    columnes `player`/`team` i el groupby petaria; en aquest cas retornem
+    directament un DataFrame buit amb l'esquema correcte.
+    """
+    if (player_match_stats is None or player_match_stats.empty
+            or "player" not in player_match_stats.columns):
+        return pd.DataFrame(columns=PLAYER_STATS_COLUMNS)
+
     agg = player_match_stats.groupby(["player", "team"]).agg(
         matches_played=("match_id", "count"),
         starts=("starter", "sum"),
@@ -545,19 +592,39 @@ def build_player_stats(player_match_stats: pd.DataFrame) -> pd.DataFrame:
         / agg["total_minutes"].replace(0, np.nan) * 90
     ).fillna(0).round(2)
 
-    return agg[["player", "team", "matches_played", "starts", "total_minutes",
-                "goals", "goals_per_90", "cards_per_90"]].sort_values("goals", ascending=False)
+    return agg[PLAYER_STATS_COLUMNS].sort_values("goals", ascending=False)
+
+
+TEAM_MATCH_STATS_COLUMNS = [
+    "team", "match_id", "jornada", "match_date", "opponent", "home_away",
+    "goals_for", "goals_against", "yellow_cards", "red_cards",
+]
 
 
 def build_team_match_stats(matches_info: pd.DataFrame,
                            player_match_stats: pd.DataFrame) -> pd.DataFrame:
-    """Estadístiques per equip i partit."""
+    """Estadístiques per equip i partit.
+
+    Guarda: si `matches_info` és buit (0 partits jugats), no té la columna
+    `jornada` i `matches_info["jornada"].astype(str)` petaria; retornem
+    directament un DataFrame buit amb l'esquema correcte.
+    """
+    if (matches_info is None or matches_info.empty
+            or "jornada" not in matches_info.columns):
+        return pd.DataFrame(columns=TEAM_MATCH_STATS_COLUMNS)
+
     matches_info = matches_info.copy()
     matches_info["match_id"] = (
         matches_info["jornada"].astype(str) + "_"
         + matches_info["home_team"].str[:3] + "_"
         + matches_info["away_team"].str[:3]
     )
+
+    if (player_match_stats is None or player_match_stats.empty
+            or "match_id" not in player_match_stats.columns):
+        player_match_stats = pd.DataFrame(
+            columns=["match_id", "team", "yellow_cards", "red_cards"]
+        )
 
     records = []
     for _, m in matches_info.iterrows():
@@ -586,6 +653,8 @@ def build_team_match_stats(matches_info: pd.DataFrame,
     df = pd.DataFrame(records)
     if not df.empty:
         df.sort_values(["jornada", "team"], inplace=True)
+    else:
+        df = pd.DataFrame(columns=TEAM_MATCH_STATS_COLUMNS)
     return df
 
 
