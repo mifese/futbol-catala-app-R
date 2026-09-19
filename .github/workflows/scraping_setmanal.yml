@@ -35,6 +35,8 @@ jobs:
           python-version: "3.11"
           cache: "pip"
       - run: pip install -r requirements.txt
+      - name: Instal·lar navegador Chromium (Playwright)
+        run: python -m playwright install --with-deps chromium
 
       - name: Scraping Tercera Catalana
         env:
@@ -72,6 +74,8 @@ jobs:
           python-version: "3.11"
           cache: "pip"
       - run: pip install -r requirements.txt
+      - name: Instal·lar navegador Chromium (Playwright)
+        run: python -m playwright install --with-deps chromium
 
       - name: Scraping Segona Catalana
         env:
@@ -109,6 +113,8 @@ jobs:
           python-version: "3.11"
           cache: "pip"
       - run: pip install -r requirements.txt
+      - name: Instal·lar navegador Chromium (Playwright)
+        run: python -m playwright install --with-deps chromium
 
       - name: Scraping Primera Catalana
         env:
