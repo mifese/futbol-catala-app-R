@@ -58,6 +58,17 @@ jobs:
           retention-days: 90
           if-no-files-found: warn
 
+      - name: Pujar depuració calendari Tercera
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-tercera-${{ github.run_number }}
+          path: |
+            debug_calendari_*.txt
+            debug_calendari_*.png
+          retention-days: 14
+          if-no-files-found: ignore
+
   # ============================================================
   # JOB B: Segona Catalana (6 grups)
   # ============================================================
@@ -97,6 +108,17 @@ jobs:
           retention-days: 90
           if-no-files-found: warn
 
+      - name: Pujar depuració calendari Segona
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-segona-${{ github.run_number }}
+          path: |
+            debug_calendari_*.txt
+            debug_calendari_*.png
+          retention-days: 14
+          if-no-files-found: ignore
+
   # ============================================================
   # JOB C: Primera Catalana (3 grups)
   # ============================================================
@@ -135,6 +157,17 @@ jobs:
           path: dades/PRIMERA/
           retention-days: 90
           if-no-files-found: warn
+
+      - name: Pujar depuració calendari Primera
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-primera-${{ github.run_number }}
+          path: |
+            debug_calendari_*.txt
+            debug_calendari_*.png
+          retention-days: 14
+          if-no-files-found: ignore
 
   # ============================================================
   # JOB D: Consolidació — s'executa quan els 3 jobs anteriors acaben
