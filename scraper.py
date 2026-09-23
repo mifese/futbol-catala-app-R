@@ -204,7 +204,7 @@ def _get_playwright_page(headless: bool = True):
     return pw, browser, page
 
 
-def scrape_calendar_playwright(categoria: str, grup: int, output_dir: Path, debug: bool = False) -> pd.DataFrame:
+def scrape_calendar_playwright(categoria: str, grup: int, debug: bool = False) -> pd.DataFrame:
     """Retorna un DataFrame amb els partits del grup (jugats o no) i, quan hi
     hagi acta disponible, la seva URL/ID.
 
