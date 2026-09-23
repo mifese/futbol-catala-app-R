@@ -74,6 +74,7 @@ import warnings
 from pathlib import Path
 
 import requests
+from bs4 import BeautifulSoup
 import pandas as pd
 import numpy as np
 from supabase import create_client, Client
@@ -119,37 +120,37 @@ MAX_JORNADES = {
 # ----------------------------------------------------------------------------
 GRUP_IDS = {
     "TERCERA": {
-        1:  None,
-        2:  None,
-        3:  {"competicioId": "58161869", "grupId": "58161876"},  # ← exemple donat
-        4:  None,
-        5:  None,
-        6:  None,
-        7:  None,
-        8:  None,
-        9:  None,
-        10: None,
-        11: None,
-        12: None,
-        13: None,
-        14: None,
-        15: None,
-        16: None,
-        17: None,
-        18: None,
+        1:  {"competicioId": "58161869", "grupId": "58161874"},
+        2:  {"competicioId": "58161869", "grupId": "58161875"},
+        3:  {"competicioId": "58161869", "grupId": "58161876"},
+        4:  {"competicioId": "58161869", "grupId": "58161872"},
+        5:  {"competicioId": "58161869", "grupId": "58161873"},
+        6:  {"competicioId": "58161869", "grupId": "58161877"},
+        7:  {"competicioId": "58161869", "grupId": "58161878"},
+        8:  {"competicioId": "58161869", "grupId": "58161879"},
+        9:  {"competicioId": "58161869", "grupId": "58161880"},
+        10: {"competicioId": "58161869", "grupId": "58161881"},
+        11: {"competicioId": "58161869", "grupId": "58161882"},
+        12: {"competicioId": "58161869", "grupId": "58161883"},
+        13: {"competicioId": "58161869", "grupId": "58161884"},
+        14: {"competicioId": "58161869", "grupId": "58161870"},
+        15: {"competicioId": "58161869", "grupId": "58161871"},
+        16: {"competicioId": "58161869", "grupId": "58161886"},
+        17: {"competicioId": "58161869", "grupId": "58161887"},
+        18: {"competicioId": "58161869", "grupId": "58161885"},
     },
     "SEGONA": {
-        1: None,
-        2: None,
-        3: None,
-        4: None,
-        5: None,
-        6: None,
+        1: {"competicioId": "58161862", "grupId": "58161863"},
+        2: {"competicioId": "58161862", "grupId": "58161864"},
+        3: {"competicioId": "58161862", "grupId": "58161865"},
+        4: {"competicioId": "58161862", "grupId": "58161866"},
+        5: {"competicioId": "58161862", "grupId": "58161867"},
+        6: {"competicioId": "58161862", "grupId": "58161868"},
     },
     "PRIMERA": {
-        1: None,
-        2: None,
-        3: None,
+        1: {"competicioId": "58161856", "grupId": "58161857"},
+        2: {"competicioId": "58161856", "grupId": "58161858"},
+        3: {"competicioId": "58161856", "grupId": "58161859"},
     },
 }
 
@@ -203,7 +204,7 @@ def _get_playwright_page(headless: bool = True):
     return pw, browser, page
 
 
-def scrape_calendar_playwright(categoria: str, grup: int, debug: bool = False) -> pd.DataFrame:
+def scrape_calendar_playwright(categoria: str, grup: int, output_dir: Path, debug: bool = False) -> pd.DataFrame:
     """Retorna un DataFrame amb els partits del grup (jugats o no) i, quan hi
     hagi acta disponible, la seva URL/ID.
 
@@ -227,29 +228,52 @@ def scrape_calendar_playwright(categoria: str, grup: int, debug: bool = False) -
         page.goto(url, timeout=60000)
         # Esperar que la SPA acabi de fer les crides internes.
         try:
-            page.wait_for_load_state("networkidle", timeout=30000)
+            page.wait_for_load_state("networkidle", timeout=45000)
         except Exception:
-            pass
-        time.sleep(2)  # marge extra per re-renderitzats posteriors a networkidle
+            print("     ⏳ networkidle no assolit en 45s, continuo igualment")
+        page.wait_for_timeout(3000)  # marge extra per re-renderitzats posteriors
 
-        # Intentar mostrar la pestanya "Calendari" si existeix, per assegurar
-        # que hi surten TOTS els partits (jugats i pendents), no només
-        # l'últim resum de jornada.
+        acta_count_before = len(page.query_selector_all("a[href*='/competicio/acta/']"))
+        print(f"     🔎 {acta_count_before} enllaços d'acta visibles ABANS de tocar cap pestanya")
+
+        # Intentar mostrar la pestanya "Calendari"/"Resultats" si existeix.
+        # Provem varies estratègies perquè no sabem com estan implementades
+        # (text pla, role=tab, botó...).
+        clicked = False
         for label in ["Calendari", "Resultats"]:
-            try:
-                loc = page.get_by_text(label, exact=True)
-                if loc.count() > 0:
-                    loc.first.click(timeout=5000)
-                    page.wait_for_timeout(1500)
-                    break
-            except Exception:
-                pass
+            if clicked:
+                break
+            for strategy_name, locator_fn in [
+                ("text exacte", lambda l: page.get_by_text(l, exact=True)),
+                ("role tab",    lambda l: page.get_by_role("tab", name=re.compile(l, re.IGNORECASE))),
+                ("text parcial", lambda l: page.get_by_text(re.compile(l, re.IGNORECASE))),
+            ]:
+                try:
+                    loc = locator_fn(label)
+                    n = loc.count()
+                    if n > 0:
+                        loc.first.click(timeout=5000)
+                        page.wait_for_timeout(2500)
+                        print(f"     🖱️  Clic a '{label}' fet servir estratègia '{strategy_name}' ({n} candidats)")
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+        if not clicked:
+            print("     ⚠️  No he trobat cap pestanya 'Calendari'/'Resultats' per clicar "
+                  "— continuo amb el que hi hagi ja carregat a la pàgina")
 
         full_text = page.inner_text("body")
+        # Sempre desem un dump per poder depurar sense haver de tornar a executar
+        # (útil sobretot si torna a donar 0 resultats).
+        debug_path = Path(f"debug_calendari_{categoria}_grup{grup}.txt")
+        debug_path.write_text(full_text, encoding="utf-8")
         if debug:
-            debug_path = Path(f"debug_calendari_{categoria}_grup{grup}.txt")
-            debug_path.write_text(full_text, encoding="utf-8")
-            print(f"     🐛 Text de depuració desat a {debug_path}")
+            try:
+                page.screenshot(path=f"debug_calendari_{categoria}_grup{grup}.png", full_page=True)
+            except Exception:
+                pass
+        print(f"     🐛 Text renderitzat desat a {debug_path} ({len(full_text)} caràcters)")
 
         # IDs d'acta presents al DOM (partits jugats).
         acta_ids = []
@@ -347,14 +371,170 @@ def compute_standings_by_round(matches: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================================
-# MÒDUL 3 — ACTA D'UN PARTIT (requests + regex, NO cal navegador)
+# MÒDUL 3 — ACTA D'UN PARTIT (requests, NO cal navegador)
 # ============================================================================
 #
-# Confirmat contra una acta real: aquesta pàgina es genera al servidor, així
-# que una petició HTTP normal ja retorna tot el contingut. En lloc de fiar-nos
-# de classes CSS concretes (que no he pogut inspeccionar en brut), fem servir
-# el text visible de la pàgina + expressions regulars, cosa que és més
-# resistent a petits canvis de maquetació.
+# ⚠️ Aquest mòdul ha estat REESCRIT i VALIDAT contra l'HTML real d'una acta
+# (gràcies al "view-source" que em vas passar). Descobriment clau: la pàgina
+# fa servir el "streaming SSR" de React/Next — el HTML inicial conté
+# <template id="P:X"></template> com a marcadors buits, i el contingut real
+# que hi ha d'anar apareix més avall al document dins de
+# <div hidden id="S:Y">...contingut...</div> seguit d'un
+# <script>$RS("S:Y","P:X")</script> que li diu al NAVEGADOR que mogui aquell
+# contingut cap al marcador. Com que nosaltres no executem JavaScript,
+# `resolve_next_streaming()` fa aquesta reconstrucció manualment abans de
+# parsejar res. Un cop resolt, la pàgina té tot el DOM real amb classes CSS
+# consistents, i d'aquí traiem:
+#   - Equips, resultat, jornada/categoria/grup, data/hora (capçalera)
+#   - Gols (secció "Gols": jugador, minut, tipus, equip)
+#   - Alineacions (seccions "Alineacions"/"Suplents"): per a cada jugador,
+#     identifiquem les insígnies de targeta groga/vermella (per color de
+#     fons: #FFEB3B / #F30000) i de substitució ("entra"/"surt", per la
+#     direcció i color de la fletxa SVG), i calculem minuts jugats, gols i
+#     targetes directament — validat contra l'acta que em vas enviar,
+#     incloent-hi la doble targeta groga i les substitucions múltiples.
+#
+# Nota: la pàgina renderitza el mateix contingut dues vegades (una versió
+# per mòbil i una per escriptori, amistoses amb Tailwind responsive), així
+# que sempre desduplicom agafant només les dues primeres seccions de cada
+# tipus (equip local i visitant) i descartant files de jugador repetides.
+
+JERSEY_ICON_HINT = "M631.2 96.5"  # tros identificatiu del path SVG de la samarreta (marca fila de jugador, no d'staff tècnic)
+
+
+def resolve_next_streaming(html: str) -> str:
+    """Substitueix els marcadors <template id="P:X"></template> pel contingut
+    real que el navegador hi mouria en execució (streaming SSR de Next.js)."""
+    soup = BeautifulSoup(html, "lxml")
+    s_divs = {}
+    for div in soup.find_all("div", attrs={"hidden": True}):
+        did = div.get("id", "")
+        if did.startswith("S:"):
+            s_divs[did.split(":", 1)[1]] = div.decode_contents()
+
+    rs_calls = re.findall(r'\$RS\("S:([^"]+)","P:([^"]+)"\)', html)
+    p_to_s = {p: s for s, p in rs_calls}
+
+    working = html
+    for _ in range(15):
+        changed = False
+        for p_id, s_id in p_to_s.items():
+            token = f'<template id="P:{p_id}"></template>'
+            if token in working and s_id in s_divs:
+                working = working.replace(token, s_divs[s_id])
+                changed = True
+        if not changed:
+            break
+    return working
+
+
+def _clean_dom(html: str):
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup.find_all(["script", "template"]):
+        tag.decompose()
+    return soup
+
+
+def _is_player_row(row_div) -> bool:
+    """Distingeix una fila de jugador (icona de samarreta) d'una fila
+    d'staff tècnic (insígnia rodona amb inicial)."""
+    return JERSEY_ICON_HINT in str(row_div)
+
+
+def _classify_badge(container) -> str | None:
+    """Classifica la insígnia (minut + icona) d'una fila de jugador."""
+    html_str = str(container)
+    if "#00FF73" in html_str:
+        return "gol"
+    if "#FFEB3B" in html_str:
+        return "groga"
+    if "bg-[#F30000]" in html_str and "<path" not in html_str:
+        return "vermella"
+    if 'd="M20 12H4' in html_str:
+        return "entra"
+    if 'd="M4 12H20' in html_str:
+        return "surt"
+    return None
+
+
+def _parse_lineup_section(header_h3, team_name: str, position_label: str):
+    """header_h3: tag <h3> amb text 'Alineacions' o 'Suplents'."""
+    container = header_h3.find_parent("div").find_next_sibling("div")
+    if container is None:
+        return []
+    out = []
+    for row in container.find_all("div", recursive=False):
+        if not _is_player_row(row):
+            continue
+        name_span = row.find("span", class_="truncate")
+        if not name_span:
+            continue
+        name = name_span.get_text(strip=True)
+        num_span = row.select_one("span.absolute.inset-0")
+        shirt = num_span.get_text(strip=True) if num_span else None
+
+        badges_roots = row.find_all("div", class_="flex items-center gap-3 shrink-0 ml-2")
+        raw_events = []
+        if badges_roots:
+            for pair in badges_roots[-1].find_all("div", recursive=False):
+                minute_span = pair.find("span")
+                minute_txt = re.sub(r"[^\d]", "", minute_span.get_text(strip=True)) if minute_span else None
+                kind = _classify_badge(pair)
+                if kind:
+                    raw_events.append((int(minute_txt) if minute_txt else None, kind))
+        out.append({
+            "team": team_name, "player": name, "shirt_number": shirt,
+            "position": position_label, "raw_events": raw_events,
+        })
+    return out
+
+
+def _extract_score(soup) -> tuple:
+    spans = soup.select("span.text-3xl.sm\\:text-4xl.md\\:text-6xl.font-bold")
+    nums = [s.get_text(strip=True) for s in spans if s.get_text(strip=True).isdigit()]
+    if len(nums) >= 2:
+        return int(nums[0]), int(nums[1])
+    return None, None
+
+
+def _extract_gols(soup, home_team, away_team, jornada, date):
+    h3 = soup.find("h3", string="Gols")
+    if not h3:
+        return []
+    outer = h3.find_parent("div")
+    if outer is None:
+        return []
+    outer2 = outer.find_parent("div")
+    container = outer2.find("div", class_="flex flex-col") if outer2 else None
+    if not container:
+        return []
+    events = []
+    for row in container.find_all("div", recursive=False):
+        name_span = row.select_one("span.line-clamp-2")
+        detail_span = row.select_one("span.text-gray-400")
+        if not name_span or not detail_span:
+            continue
+        full_name_txt = name_span.get_text(" ", strip=True)
+        m = re.match(r"(.+?)\s*\((\d+)['’]\)", full_name_txt)
+        if not m:
+            continue
+        player, minut = m.group(1).strip(), int(m.group(2))
+        detail_txt = detail_span.get_text(" ", strip=True)
+        m2 = re.match(r"GOL\s+(NORMAL|PENAL|EN PR[OÒ]PIA)\s*\(\s*(.+?)\s*\)", detail_txt, re.IGNORECASE)
+        tipus, equip = (m2.group(1), m2.group(2)) if m2 else (None, None)
+        tipus_norm = {"NORMAL": "Normal", "PENAL": "Penal"}.get((tipus or "").upper(), "Pròpia")
+        events.append({
+            "match_date": date, "jornada": jornada, "home_team": home_team, "away_team": away_team,
+            "event_type": "Gol", "minute": minut, "team": equip, "player": player, "detail": tipus_norm,
+        })
+    return events
+
+
+BREADCRUMB_RE = re.compile(r"Competici[oó]\s*/\s*([^/]+)\s*/\s*GRUP\s*(\d+)\s*/\s*Jornada\s*(\d+)", re.IGNORECASE)
+DATA_RE       = re.compile(r"Data:\s*([\d.]+)")
+HORA_RE       = re.compile(r"Hora:\s*([\d.]+)H", re.IGNORECASE)
+ESTADI_RE     = re.compile(r"Estadi:\s*(.+)")
+
 
 def get_with_retry(url: str) -> str | None:
     """Petició HTTP amb reintents i backoff exponencial."""
@@ -382,62 +562,44 @@ def get_with_retry(url: str) -> str | None:
     return None
 
 
-CLUB_LINK_RE = re.compile(
-    r'<a[^>]+href="https://www\.fcf\.cat/ca/clubs/\d+/categories/\d+"[^>]*>\s*([^<]+?)\s*</a>'
-)
-
-BREADCRUMB_RE = re.compile(r"Competici[oó]\s*/\s*([^/]+)\s*/\s*GRUP\s*(\d+)\s*/\s*Jornada\s*(\d+)", re.IGNORECASE)
-DATA_RE       = re.compile(r"Data:\s*([\d.]+)")
-HORA_RE       = re.compile(r"Hora:\s*([\d.]+)H", re.IGNORECASE)
-ESTADI_RE     = re.compile(r"Estadi:\s*(.+)")
-SCORE_RE      = re.compile(r"(?<!\d)(\d{1,2})\s*-\s*(\d{1,2})(?!\d)")
-GOL_RE        = re.compile(
-    r"([A-ZÀ-Ú'ÇÍÏÜÓÒ.,\- ]+?)\s*\((\d{1,3})'\)\s*GOL\s*(NORMAL|PENAL|EN PR[OÒ]PIA)\s*\(([^)]+)\)",
-    re.IGNORECASE,
-)
-CARD_RE = re.compile(
-    r"([A-ZÀ-Ú'ÇÍÏÜÓÒ.,\- ]+?)\s*\((\d{1,3})'\)\s*(TARGETA\s*(?:GROGA|VERMELLA)|DOBLE\s*TARGETA\s*GROGA)",
-    re.IGNORECASE,
-)
-
-
 def scrape_match_acta(acta_id: int, categoria: str, grup: int):
     """Descarrega i interpreta l'acta d'un partit (per requests, sense navegador).
 
     Retorna (match_info: dict | None, events: list[dict], lineups: list[dict], ok: bool).
-    `lineups` es deixa buit de moment: el format exacte de la taula d'alineacions
-    no s'ha pogut validar contra una acta real en brut (només en tinc la versió
-    "text pla"); es recomana revisar-ho amb --debug un cop es tingui accés al
-    HTML complet d'una acta real.
+    `lineups` ja porta minuts jugats / gols / targetes calculats directament
+    (no cal creuar-ho amb events com a l'antic scraper — la nova web dona el
+    minut de cada esdeveniment directament a la fila del jugador).
     """
     url = f"{BASE_URL}/ca/competicio/acta/{acta_id}"
     html = get_with_retry(url)
     if html is None:
         return None, [], [], False
 
-    # Traiem el text visible (sense tags) per aplicar les regex de forma
-    # robusta encara que canviïn detalls de maquetació.
     try:
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(html, "lxml")
+        resolved = resolve_next_streaming(html)
+        soup = _clean_dom(resolved)
         text = soup.get_text("\n", strip=True)
-    except Exception:
-        text = html
-
-    if "Acta" not in text and "acta" not in text:
+    except Exception as e:
+        print(f"    ❌ Error parsejant acta {acta_id}: {e}")
         return None, [], [], False
 
-    match_info = {"season": "2026-2027", "jornada": None}
+    # Equips: primers dos enllaços únics a /ca/clubs/{id}/categories/{id}
+    seen = {}
+    for a in soup.find_all("a", href=re.compile(r"/ca/clubs/\d+/categories/\d+")):
+        t = a.get_text(strip=True)
+        if t and a["href"] not in seen:
+            seen[a["href"]] = t
+    clubs = list(seen.values())
+    if len(clubs) < 2:
+        return None, [], [], False
+    home_team, away_team = clubs[0], clubs[1]
+
+    match_info = {"season": "2026-2027", "home_team": home_team, "away_team": away_team, "jornada": None}
 
     m_bc = BREADCRUMB_RE.search(text)
     if m_bc:
         match_info["competition"] = m_bc.group(1).strip()
         match_info["jornada"] = int(m_bc.group(3))
-
-    clubs = CLUB_LINK_RE.findall(html)
-    if len(clubs) >= 2:
-        match_info["home_team"] = clubs[0].strip()
-        match_info["away_team"] = clubs[1].strip()
 
     m_data = DATA_RE.search(text)
     if m_data:
@@ -445,55 +607,66 @@ def scrape_match_acta(acta_id: int, categoria: str, grup: int):
     m_hora = HORA_RE.search(text)
     if m_hora:
         match_info["time"] = m_hora.group(1)
+    m_estadi = ESTADI_RE.search(text)
+    if m_estadi:
+        match_info["venue"] = m_estadi.group(1).split("\n")[0].strip()
 
-    # Resultat final: agafem el primer "N-N" que aparegui després dels noms
-    # d'equip (evita confondre'l amb minuts o dorsals).
-    m_score = SCORE_RE.search(text)
-    if m_score:
-        try:
-            match_info["goals_home"] = int(m_score.group(1))
-            match_info["goals_away"] = int(m_score.group(2))
-        except ValueError:
-            pass
+    gh, ga = _extract_score(soup)
+    if gh is not None:
+        match_info["goals_home"], match_info["goals_away"] = gh, ga
 
-    if "jornada" not in match_info or match_info["jornada"] is None:
-        match_info["jornada"] = None  # es reomplirà pel cridant si cal
+    # --- GOLS (estructural, per evitar duplicats mòbil/escriptori) ---
+    events = _extract_gols(soup, home_team, away_team, match_info.get("jornada"), match_info.get("date"))
 
-    # --- GOLS ---
-    events = []
-    for jugador, minut, tipus, equip in GOL_RE.findall(text):
-        tipus_norm = {"NORMAL": "Normal", "PENAL": "Penal"}.get(tipus.upper(), "Pròpia")
-        events.append({
-            "match_date": match_info.get("date"),
-            "jornada":    match_info.get("jornada"),
-            "home_team":  match_info.get("home_team"),
-            "away_team":  match_info.get("away_team"),
-            "event_type": "Gol",
-            "minute":     int(minut),
-            "team":       equip.strip(),
-            "player":     jugador.strip(),
-            "detail":     tipus_norm,
-        })
+    # --- ALINEACIONS ---
+    alineacions_h = soup.find_all("h3", string="Alineacions")
+    suplents_h = soup.find_all("h3", string="Suplents")
+    raw_players = []
+    for i, h in enumerate(alineacions_h[:2]):
+        team = home_team if i == 0 else away_team
+        raw_players.extend(_parse_lineup_section(h, team, "Titular"))
+    for i, h in enumerate(suplents_h[:2]):
+        team = home_team if i == 0 else away_team
+        raw_players.extend(_parse_lineup_section(h, team, "Suplent"))
 
-    # --- TARGETES (best-effort; validar format real amb --debug) ---
-    for jugador, minut, tipus in CARD_RE.findall(text):
-        tipus_norm = "Targeta Vermella" if "VERMELLA" in tipus.upper() else "Targeta Groga"
-        events.append({
-            "match_date": match_info.get("date"),
-            "jornada":    match_info.get("jornada"),
-            "home_team":  match_info.get("home_team"),
-            "away_team":  match_info.get("away_team"),
-            "event_type": tipus_norm,
-            "minute":     int(minut),
-            "team":       None,  # no es pot atribuir l'equip sense el HTML en brut
-            "player":     jugador.strip(),
-            "detail":     None,
-        })
-
-    # --- ALINEACIONS: pendent de validar amb HTML real (veure docstring) ---
     lineups = []
+    seen_players = set()
+    for p in raw_players:
+        key = (p["team"], p["player"], p["position"])
+        if key in seen_players:
+            continue
+        seen_players.add(key)
 
-    ok = bool(match_info.get("home_team") and match_info.get("away_team"))
+        goals      = sum(1 for _, k in p["raw_events"] if k == "gol")
+        n_groga    = sum(1 for _, k in p["raw_events"] if k == "groga")
+        n_vermella = sum(1 for _, k in p["raw_events"] if k == "vermella")
+        surt_mins  = [m for m, k in p["raw_events"] if k == "surt"]
+        entra_mins = [m for m, k in p["raw_events"] if k == "entra"]
+
+        if p["position"] == "Titular":
+            minutes_played = surt_mins[0] if surt_mins else 90
+        else:
+            minutes_played = (90 - entra_mins[0]) if entra_mins else 0
+
+        yellow_cards = 1 if n_groga >= 1 else 0
+        red_cards = 1 if (n_vermella >= 1 or n_groga >= 2) else 0
+
+        lineups.append({
+            "match_date": match_info.get("date"),
+            "jornada":    match_info.get("jornada"),
+            "home_team":  home_team,
+            "away_team":  away_team,
+            "team":       p["team"],
+            "player":     p["player"],
+            "shirt_number": p["shirt_number"],
+            "position":   p["position"],
+            "minutes_played": minutes_played,
+            "goals":      goals,
+            "yellow_cards": yellow_cards,
+            "red_cards":  red_cards,
+        })
+
+    ok = bool(home_team and away_team)
     return (match_info if ok else None), events, lineups, ok
 
 
@@ -513,13 +686,20 @@ EVENTS_EMPTY_COLUMNS = [
 
 
 def build_player_match_stats(lineups: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
-    """Construeix player_match_stats a partir de lineups i events.
+    """Construeix player_match_stats a partir de lineups.
 
-    Guarda: si `lineups` és buit (p. ex. perquè encara no s'ha validat el
-    parsing d'alineacions de la nova web, o inici de temporada sense partits
-    jugats), retornem directament un DataFrame buit amb l'esquema correcte.
+    A diferència de l'scraper antic, la nova acta dona el minut de cada
+    esdeveniment (targeta/substitució/gol) directament a la fila del propi
+    jugador, així que `lineups` ja arriba amb `minutes_played`, `goals`,
+    `yellow_cards` i `red_cards` calculats al mòdul 3 — aquí només cal
+    donar-los format i afegir `match_id`. `events` es manté com a paràmetre
+    per compatibilitat però ja no cal creuar-hi dades.
+
+    Guarda: si `lineups` és buit (inici de temporada sense partits jugats),
+    retornem un DataFrame buit amb l'esquema correcte.
     """
-    if lineups is None or lineups.empty or "jornada" not in lineups.columns:
+    required_cols = {"jornada", "home_team", "away_team", "player", "team", "position"}
+    if lineups is None or lineups.empty or not required_cols.issubset(lineups.columns):
         return pd.DataFrame(columns=PLAYER_MATCH_STATS_COLUMNS)
 
     lineups = lineups.copy()
@@ -528,76 +708,17 @@ def build_player_match_stats(lineups: pd.DataFrame, events: pd.DataFrame) -> pd.
         + lineups["home_team"].str[:3] + "_"
         + lineups["away_team"].str[:3]
     )
+    lineups["starter"] = (lineups["position"] == "Titular").astype(int)
 
-    if events is None or events.empty or "jornada" not in events.columns:
-        events = pd.DataFrame(columns=EVENTS_EMPTY_COLUMNS)
-    else:
-        events = events.copy()
-        events["match_id"] = (
-            events["jornada"].astype(str) + "_"
-            + events["home_team"].str[:3] + "_"
-            + events["away_team"].str[:3]
-        )
+    for col in ["minutes_played", "goals", "yellow_cards", "red_cards"]:
+        if col not in lineups.columns:
+            lineups[col] = 0
 
-    records = []
-    for _, pr in lineups.iterrows():
-        player   = pr["player"]
-        match_id = pr["match_id"]
-        team     = pr["team"]
-        stats_text = pr["stats"]
-        starter    = 1 if pr["position"] == "Titular" else 0
+    df = lineups.rename(columns={})[
+        ["match_id", "jornada", "match_date", "player", "team",
+         "starter", "minutes_played", "goals", "yellow_cards", "red_cards"]
+    ].copy()
 
-        goals = yellow_cards = red_cards = 0
-        was_sub_out = entered_as_sub = False
-
-        if pd.notna(stats_text):
-            for s in str(stats_text).split(", "):
-                if "gol(s)" in s:
-                    try: goals = int(s.split()[0])
-                    except: goals = 1
-                if "Groga"      in s: yellow_cards = 1
-                if "Vermella"   in s: red_cards    = 1
-                if "Ha jugat"   in s: entered_as_sub  = True
-                if "Substituït" in s: was_sub_out = True
-
-        if starter:
-            if was_sub_out:
-                subst = events[
-                    (events["match_id"] == match_id) &
-                    (events["event_type"] == "Substitució") &
-                    (events["detail"].str.contains(str(player), na=False))
-                ]
-                minutes_played = int(subst.iloc[0]["minute"]) if not subst.empty else 90
-            else:
-                minutes_played = 90
-        else:
-            if entered_as_sub:
-                subst = events[
-                    (events["match_id"] == match_id) &
-                    (events["event_type"] == "Substitució") &
-                    (events["player"] == player)
-                ]
-                if not subst.empty:
-                    minutes_played = 90 - int(subst.iloc[0]["minute"])
-                else:
-                    minutes_played = 0
-            else:
-                minutes_played = 0
-
-        records.append({
-            "match_id":      match_id,
-            "jornada":       pr["jornada"],
-            "match_date":    pr["match_date"],
-            "player":        player,
-            "team":          team,
-            "starter":       starter,
-            "minutes_played": minutes_played,
-            "goals":         goals,
-            "yellow_cards":  yellow_cards,
-            "red_cards":     red_cards,
-        })
-
-    df = pd.DataFrame(records)
     if not df.empty:
         df.sort_values(["jornada", "team", "starter"], ascending=[True, True, False], inplace=True)
     else:
@@ -816,7 +937,7 @@ def upload_grup_to_supabase(client: Client, categoria: str, grup: int, output_di
 
 MATCH_INFO_COLUMNS = [
     "season", "competition", "date", "time", "jornada",
-    "home_team", "away_team", "goals_home", "goals_away",
+    "home_team", "away_team", "goals_home", "goals_away", "venue",
 ]
 MATCH_EVENTS_COLUMNS = [
     "match_date", "jornada", "home_team", "away_team",
@@ -824,7 +945,8 @@ MATCH_EVENTS_COLUMNS = [
 ]
 MATCH_LINEUPS_COLUMNS = [
     "match_date", "jornada", "home_team", "away_team",
-    "team", "player", "shirt_number", "position", "stats",
+    "team", "player", "shirt_number", "position",
+    "minutes_played", "goals", "yellow_cards", "red_cards",
 ]
 
 
@@ -876,9 +998,10 @@ def process_grup(categoria: str, grup: int, output_dir: Path, debug: bool = Fals
     print("  3/6 Consolidant matches.csv...")
     if not df_match_info.empty:
         df_matches = df_match_info.rename(columns={"home_team": "local_team"}).copy()
+        if "venue" not in df_matches.columns:
+            df_matches["venue"] = None
         df_matches = df_matches[["season", "competition", "jornada", "local_team",
-                                   "away_team", "goals_home", "goals_away"]].copy()
-        df_matches["venue"] = None
+                                   "away_team", "goals_home", "goals_away", "venue"]].copy()
     else:
         df_matches = pd.DataFrame(columns=[
             "season", "competition", "jornada", "local_team",
