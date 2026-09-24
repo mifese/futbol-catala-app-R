@@ -193,6 +193,27 @@ def competicio_url(competicio_id: str, grup_id: str) -> str:
 
 ACTA_LINK_RE = re.compile(r"/ca/competicio/acta/(\d+)")
 
+# Patró d'un bloc de partit tal com apareix al text renderitzat de la
+# pestanya "RESULTATS" (confirmat contra un dump real de Tercera Grup 3):
+#   CAMPDEVANOL, U.E. A
+#   26/09/2026
+#   16:00
+#   JOVENTUT SANT PERE MARTIR A
+#   INFORMACIÓ DEL CAMP
+#   CAMP DE FUTBOL MPAL. DE CAMPDEVÀNOL
+# (Aquest exemple és d'un partit pendent, sense resultat. Si el format d'un
+# partit ja jugat en aquesta mateixa llista difereix, aquesta part pot
+# necessitar un ajust — es guarda sempre un --debug per jornada per poder-ho
+# revisar sense haver de tornar a executar tot.)
+MATCH_BLOCK_RE = re.compile(
+    r"(?P<home>[^\n]+?)\n"
+    r"(?P<date>\d{2}/\d{2}/\d{4})\n"
+    r"(?P<time>\d{2}:\d{2})\n"
+    r"(?P<away>[^\n]+?)\n"
+    r"INFORMACI[OÓ] DEL CAMP\n"
+    r"(?P<venue>[^\n]+)"
+)
+
 
 def _get_playwright_page(headless: bool = True):
     """Crea un navegador Playwright i retorna (playwright, browser, page)."""
@@ -204,86 +225,118 @@ def _get_playwright_page(headless: bool = True):
     return pw, browser, page
 
 
+def _dismiss_cookie_banner(page):
+    """El primer cop que es carrega la web surt un banner de privacitat que
+    tapa mig contingut. Intentem tancar-lo (best-effort; si no hi és, no fa res)."""
+    for text in ["CONFIRM", "Acceptar", "ACCEPT", "D'acord"]:
+        try:
+            loc = page.get_by_text(text, exact=True)
+            if loc.count() > 0:
+                loc.first.click(timeout=3000)
+                page.wait_for_timeout(500)
+                return
+        except Exception:
+            continue
+
+
 def scrape_calendar_playwright(categoria: str, grup: int, debug: bool = False) -> pd.DataFrame:
     """Retorna un DataFrame amb els partits del grup (jugats o no) i, quan hi
-    hagi acta disponible, la seva URL/ID.
+    hagi acta disponible, el seu ID.
 
-    Columnes: jornada, local_team, away_team, acta_id (pot ser None).
-    Aquesta llista es fa servir només per saber quins partits existeixen i
-    seguir les seves actes — el detall fiable (resultat, data...) surt de
-    l'acta mateixa (mòdul 3).
+    IMPORTANT (descobert amb un dump real): la pestanya "RESULTATS" només
+    mostra UNA jornada alhora (per defecte, la següent per jugar-se — NO la
+    jornada 1), amb un selector "JORNADA" (1..30) per canviar-la. Per tant
+    cal fer clic explícitament a cada número de jornada i llegir el
+    contingut renderitzat cada vegada; no n'hi ha prou amb carregar la
+    pàgina un sol cop.
+
+    Columnes retornades: jornada, local_team, away_team, date, time, venue,
+    acta_id (None si encara no s'ha jugat).
     """
     ids = get_grup_ids(categoria, grup)
+    empty_cols = ["jornada", "local_team", "away_team", "date", "time", "venue", "acta_id"]
     if ids is None:
         print(f"     ⚠️  {categoria} Grup {grup}: falta 'competicioId'/'grupId' a "
               f"GRUP_IDS — omple'l navegant fcf.cat. Saltant.")
-        return pd.DataFrame(columns=["jornada", "local_team", "away_team", "acta_id"])
+        return pd.DataFrame(columns=empty_cols)
 
     url = competicio_url(ids["competicioId"], ids["grupId"])
     print(f"     🌐 Obrint {url}")
+
+    max_jornades = MAX_JORNADES.get(categoria, 30)
+    rows = []
+    all_acta_ids = set()
 
     pw = browser = None
     try:
         pw, browser, page = _get_playwright_page(headless=True)
         page.goto(url, timeout=60000)
-        # Esperar que la SPA acabi de fer les crides internes.
         try:
             page.wait_for_load_state("networkidle", timeout=45000)
         except Exception:
             print("     ⏳ networkidle no assolit en 45s, continuo igualment")
-        page.wait_for_timeout(3000)  # marge extra per re-renderitzats posteriors
+        page.wait_for_timeout(2000)
+        _dismiss_cookie_banner(page)
 
-        acta_count_before = len(page.query_selector_all("a[href*='/competicio/acta/']"))
-        print(f"     🔎 {acta_count_before} enllaços d'acta visibles ABANS de tocar cap pestanya")
+        # Localitzem el contenidor del selector de "JORNADA" per poder-hi
+        # clicar només dins d'aquest àmbit (evita ambigüitat amb altres
+        # números que puguin sortir a la pàgina, com resultats o dorsals).
+        try:
+            jornada_label = page.get_by_text("JORNADA", exact=True).first
+            jornada_scope = jornada_label.locator("xpath=..")
+        except Exception:
+            jornada_scope = page  # fallback: buscar a tota la pàgina
 
-        # Intentar mostrar la pestanya "Calendari"/"Resultats" si existeix.
-        # Provem varies estratègies perquè no sabem com estan implementades
-        # (text pla, role=tab, botó...).
-        clicked = False
-        for label in ["Calendari", "Resultats"]:
-            if clicked:
-                break
-            for strategy_name, locator_fn in [
-                ("text exacte", lambda l: page.get_by_text(l, exact=True)),
-                ("role tab",    lambda l: page.get_by_role("tab", name=re.compile(l, re.IGNORECASE))),
-                ("text parcial", lambda l: page.get_by_text(re.compile(l, re.IGNORECASE))),
-            ]:
-                try:
-                    loc = locator_fn(label)
-                    n = loc.count()
-                    if n > 0:
-                        loc.first.click(timeout=5000)
-                        page.wait_for_timeout(2500)
-                        print(f"     🖱️  Clic a '{label}' fet servir estratègia '{strategy_name}' ({n} candidats)")
-                        clicked = True
-                        break
-                except Exception:
-                    continue
-        if not clicked:
-            print("     ⚠️  No he trobat cap pestanya 'Calendari'/'Resultats' per clicar "
-                  "— continuo amb el que hi hagi ja carregat a la pàgina")
+        debug_chunks = []
+        for jornada in range(1, max_jornades + 1):
+            try:
+                num_loc = jornada_scope.get_by_text(str(jornada), exact=True)
+                if num_loc.count() == 0:
+                    num_loc = page.get_by_text(str(jornada), exact=True)
+                if num_loc.count() > 0:
+                    num_loc.first.click(timeout=5000)
+                    page.wait_for_timeout(1200)
+            except Exception as e:
+                print(f"     ⚠️  No he pogut clicar la jornada {jornada}: {e}")
+                continue
 
-        full_text = page.inner_text("body")
-        # Sempre desem un dump per poder depurar sense haver de tornar a executar
-        # (útil sobretot si torna a donar 0 resultats).
-        debug_path = Path(f"debug_calendari_{categoria}_grup{grup}.txt")
-        debug_path.write_text(full_text, encoding="utf-8")
+            jornada_text = page.inner_text("body")
+            debug_chunks.append(f"\n\n===== JORNADA {jornada} =====\n{jornada_text}")
+
+            # IDs d'acta d'aquesta jornada
+            jornada_acta_ids = set()
+            for a in page.query_selector_all("a[href*='/competicio/acta/']"):
+                href = a.get_attribute("href") or ""
+                m = ACTA_LINK_RE.search(href)
+                if m:
+                    jornada_acta_ids.add(int(m.group(1)))
+            all_acta_ids |= jornada_acta_ids
+
+            # Partits d'aquesta jornada (jugats o no) via el patró de bloc
+            n_before = len(rows)
+            for m in MATCH_BLOCK_RE.finditer(jornada_text):
+                rows.append({
+                    "jornada": jornada,
+                    "local_team": m.group("home").strip(),
+                    "away_team": m.group("away").strip(),
+                    "date": m.group("date"),
+                    "time": m.group("time"),
+                    "venue": m.group("venue").strip(),
+                    "acta_id": None,  # es reconcilia amb jornada_acta_ids més avall
+                })
+            print(f"     📅 Jornada {jornada:2}: {len(rows) - n_before} partits trobats, "
+                  f"{len(jornada_acta_ids)} amb acta")
+
         if debug:
+            debug_path = Path(f"debug_calendari_{categoria}_grup{grup}.txt")
+            debug_path.write_text("".join(debug_chunks), encoding="utf-8")
             try:
                 page.screenshot(path=f"debug_calendari_{categoria}_grup{grup}.png", full_page=True)
             except Exception:
                 pass
-        print(f"     🐛 Text renderitzat desat a {debug_path} ({len(full_text)} caràcters)")
+            print(f"     🐛 Text de depuració de totes les jornades desat a {debug_path}")
 
-        # IDs d'acta presents al DOM (partits jugats).
-        acta_ids = []
-        for a in page.query_selector_all("a[href*='/competicio/acta/']"):
-            href = a.get_attribute("href") or ""
-            m = ACTA_LINK_RE.search(href)
-            if m:
-                acta_ids.append(int(m.group(1)))
-        acta_ids = sorted(set(acta_ids))
-        print(f"     🔗 {len(acta_ids)} actes trobades al calendari renderitzat")
+        print(f"     🔗 {len(all_acta_ids)} actes trobades en total al calendari")
 
     finally:
         try:
@@ -297,17 +350,27 @@ def scrape_calendar_playwright(categoria: str, grup: int, debug: bool = False) -
         except Exception:
             pass
 
-    # De moment retornem només els IDs d'acta trobats; jornada/equips es
-    # reconstrueixen a partir de cada acta al mòdul 3 (que sabem que
-    # funciona). Si en el futur cal la llista completa de partits pendents
-    # (encara sense acta) caldrà ampliar aquesta funció per parsejar
-    # `full_text` — es deixa preparat el bolcat --debug per fer-ho.
-    return pd.DataFrame({
-        "jornada": [None] * len(acta_ids),
-        "local_team": [None] * len(acta_ids),
-        "away_team": [None] * len(acta_ids),
-        "acta_id": acta_ids,
-    })
+    if not rows and not all_acta_ids:
+        return pd.DataFrame(columns=empty_cols)
+
+    df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=empty_cols)
+    # No sabem, a partir del bloc de text, quin partit concret correspon a
+    # quin ID d'acta (el bloc no inclou l'ID) — de moment deixem `acta_id`
+    # buit a `df` i afegim els IDs trobats com a files addicionals mínimes
+    # perquè el pipeline (mòdul 3) els processi igualment; com que l'acta ja
+    # ens torna equips/jornada/resultat fiables, no cal fer-hi coincidir res.
+    if all_acta_ids:
+        extra = pd.DataFrame({
+            "jornada": [None] * len(all_acta_ids),
+            "local_team": [None] * len(all_acta_ids),
+            "away_team": [None] * len(all_acta_ids),
+            "date": [None] * len(all_acta_ids),
+            "time": [None] * len(all_acta_ids),
+            "venue": [None] * len(all_acta_ids),
+            "acta_id": sorted(all_acta_ids),
+        })
+        df = pd.concat([df, extra], ignore_index=True)
+    return df
 
 
 # ============================================================================
@@ -991,12 +1054,43 @@ def process_grup(categoria: str, grup: int, output_dir: Path, debug: bool = Fals
     df_events     = pd.DataFrame(all_events)     if all_events     else pd.DataFrame(columns=MATCH_EVENTS_COLUMNS)
     df_lineups    = pd.DataFrame(all_lineups)    if all_lineups    else pd.DataFrame(columns=MATCH_LINEUPS_COLUMNS)
 
-    # 3. matches.csv es reconstrueix directament a partir de les actes ja
-    #    processades (mateix nivell de detall que abans per als partits
-    #    jugats; els partits encara no jugats no hi surten fins que no
-    #    ampliem el mòdul 1 per llegir-los del calendari — veure docstring).
+    # 3. matches.csv: partim del calendari SENCER (tots els partits, jugats
+    #    o no) i hi encreuem el resultat real de les actes ja processades.
+    #    L'encreuament es fa per (jornada, equips normalitzats) perquè el
+    #    calendari mostra els noms amb una lletra de subgrup al final
+    #    ("PENYA ESPORTIVA MONTAGUT A") que l'acta no porta.
     print("  3/6 Consolidant matches.csv...")
-    if not df_match_info.empty:
+
+    def _normalize_team(name):
+        if not isinstance(name, str):
+            return name
+        return re.sub(r"\s+[A-B]$", "", name.strip()).upper()
+
+    calendar_rows = df_calendar.dropna(subset=["local_team", "away_team"]).copy() if not df_calendar.empty else pd.DataFrame()
+
+    if not calendar_rows.empty:
+        df_matches = calendar_rows[["jornada", "local_team", "away_team", "date", "venue"]].copy()
+        df_matches["goals_home"] = None
+        df_matches["goals_away"] = None
+        df_matches["season"] = "2026-2027"
+        df_matches["competition"] = f"{categoria.capitalize()} Catalana"
+
+        if not df_match_info.empty:
+            results_lookup = {}
+            for _, r in df_match_info.iterrows():
+                key = (r.get("jornada"), _normalize_team(r.get("home_team")), _normalize_team(r.get("away_team")))
+                results_lookup[key] = (r.get("goals_home"), r.get("goals_away"))
+
+            def _lookup_score(row):
+                key = (row["jornada"], _normalize_team(row["local_team"]), _normalize_team(row["away_team"]))
+                return results_lookup.get(key, (None, None))
+
+            scores = df_matches.apply(_lookup_score, axis=1)
+            df_matches["goals_home"] = [s[0] for s in scores]
+            df_matches["goals_away"] = [s[1] for s in scores]
+    elif not df_match_info.empty:
+        # Sense calendari (p. ex. Playwright no ha pogut recórrer les jornades)
+        # però amb actes: com a mínim guardem els partits jugats trobats.
         df_matches = df_match_info.rename(columns={"home_team": "local_team"}).copy()
         if "venue" not in df_matches.columns:
             df_matches["venue"] = None
@@ -1007,12 +1101,14 @@ def process_grup(categoria: str, grup: int, output_dir: Path, debug: bool = Fals
             "season", "competition", "jornada", "local_team",
             "away_team", "goals_home", "goals_away", "venue",
         ])
+
     if not df_matches.empty:
         df_matches.insert(0, "categoria", categoria)
         df_matches.insert(1, "grup", grup)
         df_matches.sort_values(["jornada", "local_team"], inplace=True)
     df_matches.to_csv(output_dir / "matches.csv", index=False)
-    print(f"     ✅ {len(df_matches)} partits (dels trobats al calendari)")
+    n_jugats = int(df_matches["goals_home"].notna().sum()) if not df_matches.empty else 0
+    print(f"     ✅ {len(df_matches)} partits ({n_jugats} jugats)")
 
     # 4. Classificació per jornada
     print("  4/6 Classificació per jornada...")
