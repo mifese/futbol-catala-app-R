@@ -226,15 +226,36 @@ def _get_playwright_page(headless: bool = True):
 
 
 def _dismiss_cookie_banner(page):
-    """El primer cop que es carrega la web surt un banner de privacitat que
-    tapa mig contingut. Intentem tancar-lo (best-effort; si no hi és, no fa res)."""
-    for text in ["CONFIRM", "Acceptar", "ACCEPT", "D'acord"]:
+    """El primer cop que es carrega la web surt el banner de consentiment de
+    cookies de Quantcast Choice (id="qc-cmp2-container"), que INTERCEPTA els
+    clics a la resta de la pàgina fins i tot quan sembla tancat (confirmat
+    contra un log real: `Locator.click` fallava repetidament amb "subtree
+    intercepts pointer events" apuntant a aquest element).
+
+    En lloc de mirar d'encertar el botó exacte (que pot variar: "CONFIRM",
+    "AGREE", una "X"...), l'eliminem directament del DOM per JavaScript —
+    molt més robust perquè no depèn de saber quin text porta el botó.
+    """
+    try:
+        page.evaluate("""
+            () => {
+                document.querySelectorAll(
+                    '[id^="qc-cmp2"], .qc-cmp2-container, .qc-cmp2-summary-buttons, [class*="qc-cmp"]'
+                ).forEach(el => el.remove());
+                document.documentElement.style.overflow = 'auto';
+                document.body.style.overflow = 'auto';
+            }
+        """)
+    except Exception:
+        pass
+    # Per si de cas encara en queda algun rastre visible, provem també de
+    # clicar els botons habituals (best-effort, no crític si falla).
+    for text in ["CONFIRM", "AGREE", "I Agree", "Acceptar", "ACCEPT ALL", "D'acord"]:
         try:
             loc = page.get_by_text(text, exact=True)
             if loc.count() > 0:
-                loc.first.click(timeout=3000)
-                page.wait_for_timeout(500)
-                return
+                loc.first.click(timeout=2000, force=True)
+                page.wait_for_timeout(300)
         except Exception:
             continue
 
@@ -294,7 +315,14 @@ def scrape_calendar_playwright(categoria: str, grup: int, debug: bool = False) -
                 if num_loc.count() == 0:
                     num_loc = page.get_by_text(str(jornada), exact=True)
                 if num_loc.count() > 0:
-                    num_loc.first.click(timeout=5000)
+                    try:
+                        num_loc.first.click(timeout=4000)
+                    except Exception:
+                        # Sol fallar si un altre element (p. ex. el banner de
+                        # cookies) encara intercepta els clics; ho tornem a
+                        # netejar i forcem el clic ignorant el check.
+                        _dismiss_cookie_banner(page)
+                        num_loc.first.click(timeout=4000, force=True)
                     page.wait_for_timeout(1200)
             except Exception as e:
                 print(f"     ⚠️  No he pogut clicar la jornada {jornada}: {e}")
@@ -327,14 +355,14 @@ def scrape_calendar_playwright(categoria: str, grup: int, debug: bool = False) -
             print(f"     📅 Jornada {jornada:2}: {len(rows) - n_before} partits trobats, "
                   f"{len(jornada_acta_ids)} amb acta")
 
+        debug_path = Path(f"debug_calendari_{categoria}_grup{grup}.txt")
+        debug_path.write_text("".join(debug_chunks), encoding="utf-8")
+        print(f"     🐛 Text de depuració de totes les jornades desat a {debug_path}")
         if debug:
-            debug_path = Path(f"debug_calendari_{categoria}_grup{grup}.txt")
-            debug_path.write_text("".join(debug_chunks), encoding="utf-8")
             try:
                 page.screenshot(path=f"debug_calendari_{categoria}_grup{grup}.png", full_page=True)
             except Exception:
                 pass
-            print(f"     🐛 Text de depuració de totes les jornades desat a {debug_path}")
 
         print(f"     🔗 {len(all_acta_ids)} actes trobades en total al calendari")
 
