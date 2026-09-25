@@ -308,6 +308,29 @@ def scrape_calendar_playwright(categoria: str, grup: int, debug: bool = False) -
         except Exception:
             jornada_scope = page  # fallback: buscar a tota la pàgina
 
+        # DIAGNÒSTIC: bolquem l'HTML real del voltant de "JORNADA" (pujant
+        # uns quants nivells de pare) perquè, si el clic no canvia res,
+        # puguem veure exactament com estan construïts els números sense
+        # haver de tornar a executar res més.
+        try:
+            dom_dump = page.evaluate("""
+                () => {
+                    const walker = document.evaluate(
+                        "//*[text()='JORNADA']", document, null,
+                        XPathResult.FIRST_ORDERED_NODE_TYPE, null
+                    );
+                    let el = walker.singleNodeValue;
+                    for (let i = 0; i < 4 && el && el.parentElement; i++) {
+                        el = el.parentElement;
+                    }
+                    return el ? el.outerHTML : 'NO TROBAT';
+                }
+            """)
+            Path(f"debug_dom_jornada_{categoria}_grup{grup}.html").write_text(dom_dump, encoding="utf-8")
+            print(f"     🐛 HTML del selector de jornada desat a debug_dom_jornada_{categoria}_grup{grup}.html")
+        except Exception as e:
+            print(f"     ⚠️  No he pogut bolcar l'HTML del selector: {e}")
+
         debug_chunks = []
         for jornada in range(1, max_jornades + 1):
             try:
@@ -327,6 +350,14 @@ def scrape_calendar_playwright(categoria: str, grup: int, debug: bool = False) -
             except Exception as e:
                 print(f"     ⚠️  No he pogut clicar la jornada {jornada}: {e}")
                 continue
+
+            if jornada == 1:
+                # Captura sempre (no només amb --debug) per poder veure d'un
+                # cop d'ull si el clic ha canviat res visualment.
+                try:
+                    page.screenshot(path=f"debug_jornada1_{categoria}_grup{grup}.png", full_page=True)
+                except Exception:
+                    pass
 
             jornada_text = page.inner_text("body")
             debug_chunks.append(f"\n\n===== JORNADA {jornada} =====\n{jornada_text}")
