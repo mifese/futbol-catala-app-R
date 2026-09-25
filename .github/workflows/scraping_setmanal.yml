@@ -66,6 +66,8 @@ jobs:
           path: |
             debug_calendari_*.txt
             debug_calendari_*.png
+            debug_dom_jornada_*.html
+            debug_jornada1_*.png
           retention-days: 14
           if-no-files-found: ignore
 
@@ -116,6 +118,8 @@ jobs:
           path: |
             debug_calendari_*.txt
             debug_calendari_*.png
+            debug_dom_jornada_*.html
+            debug_jornada1_*.png
           retention-days: 14
           if-no-files-found: ignore
 
@@ -166,6 +170,8 @@ jobs:
           path: |
             debug_calendari_*.txt
             debug_calendari_*.png
+            debug_dom_jornada_*.html
+            debug_jornada1_*.png
           retention-days: 14
           if-no-files-found: ignore
 
