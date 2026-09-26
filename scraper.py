@@ -307,19 +307,28 @@ def scrape_calendar_playwright(categoria: str, grup: int, debug: bool = False) -
         for jornada in range(1, max_jornades + 1):
             try:
                 num_loc = page.locator(f'button[data-jornada="{jornada}"]')
-                if num_loc.count() > 0:
-                    try:
-                        num_loc.first.click(timeout=4000)
-                    except Exception:
-                        # Sol fallar si un altre element (p. ex. el banner de
-                        # cookies) encara intercepta els clics; ho tornem a
-                        # netejar i forcem el clic ignorant el check.
-                        _dismiss_cookie_banner(page)
-                        num_loc.first.click(timeout=4000, force=True)
-                    page.wait_for_timeout(1500)
-                else:
+                if num_loc.count() == 0:
                     print(f"     ⚠️  No he trobat el botó de la jornada {jornada}")
                     continue
+                # Clic per JavaScript (element.click()) en lloc del clic
+                # "físic" de Playwright: la pàgina ha mostrat diferents tipus
+                # de superposicions (banner de cookies, pop-ups publicitaris)
+                # que poden interceptar un clic basat en coordenades de
+                # pantalla — fins i tot amb force=True. Cridar .click()
+                # directament sobre l'element pel DOM ho evita del tot,
+                # independentment del que hi hagi visualment per sobre.
+                clicked = page.evaluate(
+                    """(n) => {
+                        const el = document.querySelector(`button[data-jornada="${n}"]`);
+                        if (el) { el.click(); return true; }
+                        return false;
+                    }""",
+                    jornada,
+                )
+                if not clicked:
+                    print(f"     ⚠️  No he pogut clicar la jornada {jornada} (element no trobat per JS)")
+                    continue
+                page.wait_for_timeout(1500)
             except Exception as e:
                 print(f"     ⚠️  No he pogut clicar la jornada {jornada}: {e}")
                 continue
