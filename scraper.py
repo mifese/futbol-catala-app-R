@@ -299,44 +299,14 @@ def scrape_calendar_playwright(categoria: str, grup: int, debug: bool = False) -
         page.wait_for_timeout(2000)
         _dismiss_cookie_banner(page)
 
-        # Localitzem el contenidor del selector de "JORNADA" per poder-hi
-        # clicar només dins d'aquest àmbit (evita ambigüitat amb altres
-        # números que puguin sortir a la pàgina, com resultats o dorsals).
-        try:
-            jornada_label = page.get_by_text("JORNADA", exact=True).first
-            jornada_scope = jornada_label.locator("xpath=..")
-        except Exception:
-            jornada_scope = page  # fallback: buscar a tota la pàgina
-
-        # DIAGNÒSTIC: bolquem l'HTML real del voltant de "JORNADA" (pujant
-        # uns quants nivells de pare) perquè, si el clic no canvia res,
-        # puguem veure exactament com estan construïts els números sense
-        # haver de tornar a executar res més.
-        try:
-            dom_dump = page.evaluate("""
-                () => {
-                    const walker = document.evaluate(
-                        "//*[text()='JORNADA']", document, null,
-                        XPathResult.FIRST_ORDERED_NODE_TYPE, null
-                    );
-                    let el = walker.singleNodeValue;
-                    for (let i = 0; i < 4 && el && el.parentElement; i++) {
-                        el = el.parentElement;
-                    }
-                    return el ? el.outerHTML : 'NO TROBAT';
-                }
-            """)
-            Path(f"debug_dom_jornada_{categoria}_grup{grup}.html").write_text(dom_dump, encoding="utf-8")
-            print(f"     🐛 HTML del selector de jornada desat a debug_dom_jornada_{categoria}_grup{grup}.html")
-        except Exception as e:
-            print(f"     ⚠️  No he pogut bolcar l'HTML del selector: {e}")
+        # Cada jornada és un <button data-jornada="N"> — selector exacte i
+        # inequívoc, molt més fiable que buscar pel text "N" (que abans no
+        # canviava la jornada seleccionada tot i clicar-hi sense error).
 
         debug_chunks = []
         for jornada in range(1, max_jornades + 1):
             try:
-                num_loc = jornada_scope.get_by_text(str(jornada), exact=True)
-                if num_loc.count() == 0:
-                    num_loc = page.get_by_text(str(jornada), exact=True)
+                num_loc = page.locator(f'button[data-jornada="{jornada}"]')
                 if num_loc.count() > 0:
                     try:
                         num_loc.first.click(timeout=4000)
@@ -346,7 +316,10 @@ def scrape_calendar_playwright(categoria: str, grup: int, debug: bool = False) -
                         # netejar i forcem el clic ignorant el check.
                         _dismiss_cookie_banner(page)
                         num_loc.first.click(timeout=4000, force=True)
-                    page.wait_for_timeout(1200)
+                    page.wait_for_timeout(1500)
+                else:
+                    print(f"     ⚠️  No he trobat el botó de la jornada {jornada}")
+                    continue
             except Exception as e:
                 print(f"     ⚠️  No he pogut clicar la jornada {jornada}: {e}")
                 continue
