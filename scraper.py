@@ -215,6 +215,111 @@ MATCH_BLOCK_RE = re.compile(
 )
 
 
+def _remove_overlays(page):
+    """Elimina agressivament qualsevol element que pugui estar tapant/
+    interceptant clics: el banner de cookies (Quantcast) i, de forma més
+    genèrica, qualsevol element `position: fixed`/`position: sticky` que
+    cobreixi una part gran de la pantalla (típic de pop-ups publicitaris,
+    que canvien de proveïdor i de classe CSS cada vegada)."""
+    try:
+        page.evaluate("""
+            () => {
+                document.querySelectorAll(
+                    '[id^="qc-cmp2"], .qc-cmp2-container, [class*="qc-cmp"]'
+                ).forEach(el => el.remove());
+
+                const vw = window.innerWidth, vh = window.innerHeight;
+                document.querySelectorAll('body *').forEach(el => {
+                    const style = window.getComputedStyle(el);
+                    if (style.position === 'fixed' || style.position === 'sticky') {
+                        const r = el.getBoundingClientRect();
+                        const area = Math.max(0, r.width) * Math.max(0, r.height);
+                        if (area > 0.3 * vw * vh) {
+                            el.remove();
+                        }
+                    }
+                });
+                document.documentElement.style.overflow = 'auto';
+                document.body.style.overflow = 'auto';
+            }
+        """)
+    except Exception:
+        pass
+
+
+def _click_jornada_button(page, jornada: int) -> bool:
+    """Clica el botó d'una jornada amb tres nivells de fallback, verificant
+    al final si el botó ha quedat marcat com a seleccionat (canvi de classe
+    CSS a `text-[#F30000]`, el color que fa servir la web per a la jornada
+    activa) — així sabem del cert si el clic ha tingut efecte real, no només
+    si Playwright no ha llançat cap error.
+    """
+    selector = f'button[data-jornada="{jornada}"]'
+
+    def is_selected():
+        try:
+            return page.evaluate(
+                """(sel) => {
+                    const el = document.querySelector(sel);
+                    return el ? el.className.includes('F30000') : false;
+                }""",
+                selector,
+            )
+        except Exception:
+            return False
+
+    if is_selected():
+        return True  # ja hi estàvem (p. ex. la jornada per defecte)
+
+    _remove_overlays(page)
+
+    # Nivell 1: clic natiu de Playwright (el més fiable si no hi ha res a sobre)
+    try:
+        page.locator(selector).first.click(timeout=3000)
+        page.wait_for_timeout(800)
+        if is_selected():
+            return True
+    except Exception:
+        pass
+
+    # Nivell 2: clic forçat (ignora la comprovació d'intercepció de Playwright)
+    _remove_overlays(page)
+    try:
+        page.locator(selector).first.click(timeout=3000, force=True)
+        page.wait_for_timeout(800)
+        if is_selected():
+            return True
+    except Exception:
+        pass
+
+    # Nivell 3: seqüència completa d'esdeveniments per JavaScript
+    # (pointerdown/mousedown/pointerup/mouseup/click) — per si el component
+    # reacciona a events de punter/ratolí en lloc du un simple "click".
+    try:
+        page.evaluate(
+            """(sel) => {
+                const el = document.querySelector(sel);
+                if (!el) return;
+                const r = el.getBoundingClientRect();
+                const x = r.left + r.width / 2, y = r.top + r.height / 2;
+                const opts = {bubbles: true, cancelable: true, clientX: x, clientY: y};
+                ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(type => {
+                    const EventCtor = type.startsWith('pointer') ? PointerEvent : MouseEvent;
+                    el.dispatchEvent(new EventCtor(type, opts));
+                });
+            }""",
+            selector,
+        )
+        page.wait_for_timeout(800)
+        if is_selected():
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+
 def _get_playwright_page(headless: bool = True):
     """Crea un navegador Playwright i retorna (playwright, browser, page)."""
     from playwright.sync_api import sync_playwright
@@ -305,33 +410,11 @@ def scrape_calendar_playwright(categoria: str, grup: int, debug: bool = False) -
 
         debug_chunks = []
         for jornada in range(1, max_jornades + 1):
-            try:
-                num_loc = page.locator(f'button[data-jornada="{jornada}"]')
-                if num_loc.count() == 0:
-                    print(f"     ⚠️  No he trobat el botó de la jornada {jornada}")
-                    continue
-                # Clic per JavaScript (element.click()) en lloc del clic
-                # "físic" de Playwright: la pàgina ha mostrat diferents tipus
-                # de superposicions (banner de cookies, pop-ups publicitaris)
-                # que poden interceptar un clic basat en coordenades de
-                # pantalla — fins i tot amb force=True. Cridar .click()
-                # directament sobre l'element pel DOM ho evita del tot,
-                # independentment del que hi hagi visualment per sobre.
-                clicked = page.evaluate(
-                    """(n) => {
-                        const el = document.querySelector(`button[data-jornada="${n}"]`);
-                        if (el) { el.click(); return true; }
-                        return false;
-                    }""",
-                    jornada,
-                )
-                if not clicked:
-                    print(f"     ⚠️  No he pogut clicar la jornada {jornada} (element no trobat per JS)")
-                    continue
-                page.wait_for_timeout(1500)
-            except Exception as e:
-                print(f"     ⚠️  No he pogut clicar la jornada {jornada}: {e}")
-                continue
+            ok_click = _click_jornada_button(page, jornada)
+            if not ok_click:
+                print(f"     ⚠️  Jornada {jornada}: el clic no ha canviat la selecció "
+                      f"(3 nivells provats) — es continua igualment amb el que hi hagi")
+            page.wait_for_timeout(700)
 
             if jornada == 1:
                 # Captura sempre (no només amb --debug) per poder veure d'un
