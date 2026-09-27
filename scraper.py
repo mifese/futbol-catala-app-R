@@ -5,27 +5,30 @@ scraper.py — Scraping automatitzat de la FCF (NOVA WEB, Next.js)
 IMPORTANT — llegeix això abans d'executar:
 
 La FCF ha canviat completament la web (fcf.cat) a una aplicació Next.js.
-Això afecta el scraper en dos punts molt diferents:
+Investigant-la a fons (capturant les peticions de xarxa reals que fa el
+navegador) hem trobat que TOT el que necessitem és accessible amb simples
+peticions HTTP (`requests`) — NO cal cap navegador (Playwright) enlloc:
 
-1. La pàgina de "fitxa de competició" (calendari/resultats/classificació
-   d'un grup, https://www.fcf.cat/ca/competicio?...&grupId=...) es genera
-   ÍNTEGRAMENT al navegador (React) — l'HTML que arriba per una petició
-   HTTP normal NO conté cap partit ni classificació. Cal un navegador real
-   (Playwright) perquè el JavaScript s'executi i pinti les dades. La resta
-   de scrapers que s'han trobat fent servir la FCF confirmen el mateix
-   (la seva API interna té protecció anti-bot i només accepta navegadors).
+1. El calendari de partits d'un grup (jugats o no, amb resultat i ID
+   d'acta) s'obté cridant l'API interna:
+       GET https://www.fcf.cat/api/competition/partidos?grupId={grupId}
+   Aquesta és la mateixa crida que fa el navegador en carregar la pàgina
+   de "fitxa de competició" — i només se'n fa UNA per grup: la pestanya
+   "JORNADA" no torna a demanar res al servidor, només filtra en local
+   les dades que ja té totes carregades. Per això la vam trobar mirant el
+   registre de peticions de xarxa d'una sessió real amb Playwright, tot
+   i que ara ja no calgui el navegador per fer-la servir.
 
 2. La pàgina d'ACTA d'un partit concret
-   (https://www.fcf.cat/ca/competicio/acta/{id}) SÍ que ve generada pel
-   servidor: es pot descarregar amb una simple petició HTTP (requests) i
-   ja hi surt tota la informació (equips, resultat, gols amb minut i tipus,
-   alineacions). NO cal navegador per aquesta part — més ràpid i fiable.
+   (https://www.fcf.cat/ca/competicio/acta/{id}) ve generada pel servidor
+   (Next.js streaming SSR): es descarrega amb una petició HTTP normal i
+   se'n reconstrueix el contingut real (equips, resultat, gols amb minut
+   i tipus, alineacions amb targetes/substitucions) — validat contra
+   dades reals.
 
-Per tant aquest scraper és HÍBRID:
-  - Playwright (navegador headless) només per descobrir, per a cada grup,
-    la llista de partits de cada jornada i l'ID d'acta de cada partit jugat.
-  - requests (HTTP normal, ràpid) per descarregar cada acta i extreure'n
-    tots els detalls.
+Per tant aquest scraper és 100% `requests` + `BeautifulSoup`, sense cap
+navegador: més ràpid, més fiable i sense les dependències pesades de
+Playwright/Chromium.
 
 CONFIGURACIÓ QUE HAS D'OMPLIR TU (un cop per temporada, ~15 min):
   El diccionari GRUP_IDS més avall necessita, per a cada categoria i grup,
@@ -44,19 +47,18 @@ CONFIGURACIÓ QUE HAS D'OMPLIR TU (un cop per temporada, ~15 min):
   el scraper saltarà (amb avís) els grups que no tinguin ID configurat.
 
 AVÍS SOBRE FIABILITAT:
-  No he pogut executar aquest scraper contra el lloc real (no tinc accés
-  a un navegador ni a fcf.cat des d'aquí), així que la part de Playwright
-  (extreure la llista de partits/jornades del calendari renderitzat) és
-  la meva millor estimació basada en el que se sap de la web, però pot
-  necessitar ajustos un cop la provis. Per això:
-    - Hi ha un mode --debug que desa el text renderitzat de la primera
-      pàgina de calendari a un fitxer .txt, perquè puguem revisar-lo i
-      ajustar les expressions regulars si cal.
-    - La part de l'ACTA (mòdul 3) SÍ que s'ha provat contra una acta real
-      (la que em vas passar) i el parsing de gols funciona correctament.
-      Les alineacions/targetes són best-effort: si el format real no
-      coincideix exactament, es guardaran com a None/buit en lloc de
-      petar, i podrem ajustar-ho amb un exemple real.
+  No he pogut cridar l'API `partidos` des d'aquí per veure l'estructura
+  exacta del JSON de resposta (no tinc accés directe a fcf.cat), així que
+  `scrape_calendar_api()`:
+    - Sempre desa la resposta crua a `debug_api_partidos_*.json` — si els
+      noms de camp no coincideixen amb els que he suposat (català/castellà
+      barrejat, típic d'aquesta API), es podrà ajustar de seguida mirant
+      aquest fitxer, sense haver de tornar a capturar res amb Playwright.
+    - Prova diverses variants de nom de camp i cau a un DataFrame buit
+      (sense petar) si no reconeix l'estructura.
+  La part de l'ACTA (mòdul 3) SÍ que s'ha provat contra una acta real i
+  contra la captura de pantalla que em vas passar (gols, targetes grogues/
+  vermelles i substitucions coincideixen exactament).
 
 Ús:
     python scraper.py --categoria TERCERA --grup 3          # un sol grup
@@ -168,367 +170,133 @@ def competicio_url(competicio_id: str, grup_id: str) -> str:
 
 
 # ============================================================================
-# MÒDUL 1 — CALENDARI DE PARTITS D'UN GRUP (Playwright, requereix navegador)
+# MÒDUL 1 — CALENDARI DE PARTITS D'UN GRUP (API interna, NO cal navegador)
 # ============================================================================
 #
-# La pàgina de competició és una SPA en React: cal esperar que el JavaScript
-# carregui les dades. Estratègia:
-#   1. Navegar a la URL del grup.
-#   2. Esperar que la xarxa quedi inactiva (networkidle) — dona temps a la
-#      crida interna que omple el calendari.
-#   3. Recollir TOTS els enllaços <a href="…/competicio/acta/{id}"> que hi
-#      hagi renderitzats a la pàgina — aquests corresponen als partits ja
-#      jugats (amb acta tancada). No calen selectors CSS fràgils per això:
-#      només cal que l'enllaç existeixi al DOM.
-#   4. Per a cada partit (jugat o no), intentar llegir la fila/contenidor
-#      que envolta l'enllaç (o, si no n'hi ha per partits no jugats, el
-#      text ordenat de tota la pàgina) per treure equip local/visitant,
-#      jornada i data. Aquesta part és la que caldrà validar/ajustar amb
-#      un cas real (--debug bolca el text complet per revisar-lo).
+# DESCOBERT capturant les peticions de xarxa amb Playwright (veure historial):
+# quan es carrega la pàgina de competició, el navegador fa una única crida a
+#     GET https://www.fcf.cat/api/competition/partidos?grupId={grupId}
+# i mai més se'n torna a fer cap altra en canviar de jornada — la pestanya
+# "JORNADA" només filtra en local les dades que ja té totes carregades.
+# Això vol dir que aquesta única crida ja porta tots els partits de la
+# temporada sencera, i podem descarregar-la directament amb `requests`,
+# sense necessitat de cap navegador ni de simular cap clic.
 #
-# Un cop tenim els IDs d'acta, tota la informació fiable (equips, resultat,
-# jornada, data) es torna a confirmar directament des de l'acta (mòdul 3),
-# així que aquesta llista només ha de ser prou bona per: (a) saber quants
-# partits/jornades hi ha en total, i (b) donar-nos els IDs d'acta a seguir.
+# ⚠️ No he pogut verificar l'estructura exacta del JSON de resposta (no tinc
+# accés a fcf.cat des d'aquí per inspeccionar-la en viu), així que aquesta
+# funció:
+#   1. Sempre desa la resposta crua a un fitxer de depuració
+#      (`debug_api_partidos_{categoria}_grup{grup}.json`) — si el format no
+#      coincideix amb el que espero, es podrà ajustar de seguida mirant
+#      aquest fitxer, sense haver de tornar a capturar res.
+#   2. Prova diverses variants raonables de noms de camp (en català/castellà,
+#      que és el que fa servir la resta de l'API: "jornada", "equipLocal",
+#      "equipVisitant", "golsLocal", "actaId"...) i cau de nou a un DataFrame
+#      buit si no reconeix l'estructura, en lloc de petar.
 
-ACTA_LINK_RE = re.compile(r"/ca/competicio/acta/(\d+)")
-
-# Patró d'un bloc de partit tal com apareix al text renderitzat de la
-# pestanya "RESULTATS" (confirmat contra un dump real de Tercera Grup 3):
-#   CAMPDEVANOL, U.E. A
-#   26/09/2026
-#   16:00
-#   JOVENTUT SANT PERE MARTIR A
-#   INFORMACIÓ DEL CAMP
-#   CAMP DE FUTBOL MPAL. DE CAMPDEVÀNOL
-# (Aquest exemple és d'un partit pendent, sense resultat. Si el format d'un
-# partit ja jugat en aquesta mateixa llista difereix, aquesta part pot
-# necessitar un ajust — es guarda sempre un --debug per jornada per poder-ho
-# revisar sense haver de tornar a executar tot.)
-MATCH_BLOCK_RE = re.compile(
-    r"(?P<home>[^\n]+?)\n"
-    r"(?P<date>\d{2}/\d{2}/\d{4})\n"
-    r"(?P<time>\d{2}:\d{2})\n"
-    r"(?P<away>[^\n]+?)\n"
-    r"INFORMACI[OÓ] DEL CAMP\n"
-    r"(?P<venue>[^\n]+)"
-)
-
-
-def _remove_overlays(page):
-    """Elimina agressivament qualsevol element que pugui estar tapant/
-    interceptant clics: el banner de cookies (Quantcast) i, de forma més
-    genèrica, qualsevol element `position: fixed`/`position: sticky` que
-    cobreixi una part gran de la pantalla (típic de pop-ups publicitaris,
-    que canvien de proveïdor i de classe CSS cada vegada)."""
-    try:
-        page.evaluate("""
-            () => {
-                document.querySelectorAll(
-                    '[id^="qc-cmp2"], .qc-cmp2-container, [class*="qc-cmp"]'
-                ).forEach(el => el.remove());
-
-                const vw = window.innerWidth, vh = window.innerHeight;
-                document.querySelectorAll('body *').forEach(el => {
-                    const style = window.getComputedStyle(el);
-                    if (style.position === 'fixed' || style.position === 'sticky') {
-                        const r = el.getBoundingClientRect();
-                        const area = Math.max(0, r.width) * Math.max(0, r.height);
-                        if (area > 0.3 * vw * vh) {
-                            el.remove();
-                        }
-                    }
-                });
-                document.documentElement.style.overflow = 'auto';
-                document.body.style.overflow = 'auto';
-            }
-        """)
-    except Exception:
-        pass
-
-
-def _click_jornada_button(page, jornada: int) -> bool:
-    """Clica el botó d'una jornada amb tres nivells de fallback, verificant
-    al final si el botó ha quedat marcat com a seleccionat (canvi de classe
-    CSS a `text-[#F30000]`, el color que fa servir la web per a la jornada
-    activa) — així sabem del cert si el clic ha tingut efecte real, no només
-    si Playwright no ha llançat cap error.
-    """
-    selector = f'button[data-jornada="{jornada}"]'
-
-    def is_selected():
-        try:
-            return page.evaluate(
-                """(sel) => {
-                    const el = document.querySelector(sel);
-                    return el ? el.className.includes('F30000') : false;
-                }""",
-                selector,
-            )
-        except Exception:
-            return False
-
-    if is_selected():
-        return True  # ja hi estàvem (p. ex. la jornada per defecte)
-
-    _remove_overlays(page)
-
-    # Nivell 1: clic natiu de Playwright (el més fiable si no hi ha res a sobre)
-    try:
-        page.locator(selector).first.click(timeout=3000)
-        page.wait_for_timeout(800)
-        if is_selected():
-            return True
-    except Exception:
-        pass
-
-    # Nivell 2: clic forçat (ignora la comprovació d'intercepció de Playwright)
-    _remove_overlays(page)
-    try:
-        page.locator(selector).first.click(timeout=3000, force=True)
-        page.wait_for_timeout(800)
-        if is_selected():
-            return True
-    except Exception:
-        pass
-
-    # Nivell 3: seqüència completa d'esdeveniments per JavaScript
-    # (pointerdown/mousedown/pointerup/mouseup/click) — per si el component
-    # reacciona a events de punter/ratolí en lloc du un simple "click".
-    try:
-        page.evaluate(
-            """(sel) => {
-                const el = document.querySelector(sel);
-                if (!el) return;
-                const r = el.getBoundingClientRect();
-                const x = r.left + r.width / 2, y = r.top + r.height / 2;
-                const opts = {bubbles: true, cancelable: true, clientX: x, clientY: y};
-                ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(type => {
-                    const EventCtor = type.startsWith('pointer') ? PointerEvent : MouseEvent;
-                    el.dispatchEvent(new EventCtor(type, opts));
-                });
-            }""",
-            selector,
-        )
-        page.wait_for_timeout(800)
-        if is_selected():
-            return True
-    except Exception:
-        pass
-
-    return False
-
-
-
-def _get_playwright_page(headless: bool = True):
-    """Crea un navegador Playwright i retorna (playwright, browser, page)."""
-    from playwright.sync_api import sync_playwright
-    pw = sync_playwright().start()
-    browser = pw.chromium.launch(headless=headless)
-    context = browser.new_context(user_agent=HEADERS["User-Agent"])
-    page = context.new_page()
-    return pw, browser, page
-
-
-def _dismiss_cookie_banner(page):
-    """El primer cop que es carrega la web surt el banner de consentiment de
-    cookies de Quantcast Choice (id="qc-cmp2-container"), que INTERCEPTA els
-    clics a la resta de la pàgina fins i tot quan sembla tancat (confirmat
-    contra un log real: `Locator.click` fallava repetidament amb "subtree
-    intercepts pointer events" apuntant a aquest element).
-
-    En lloc de mirar d'encertar el botó exacte (que pot variar: "CONFIRM",
-    "AGREE", una "X"...), l'eliminem directament del DOM per JavaScript —
-    molt més robust perquè no depèn de saber quin text porta el botó.
-    """
-    try:
-        page.evaluate("""
-            () => {
-                document.querySelectorAll(
-                    '[id^="qc-cmp2"], .qc-cmp2-container, .qc-cmp2-summary-buttons, [class*="qc-cmp"]'
-                ).forEach(el => el.remove());
-                document.documentElement.style.overflow = 'auto';
-                document.body.style.overflow = 'auto';
-            }
-        """)
-    except Exception:
-        pass
-    # Per si de cas encara en queda algun rastre visible, provem també de
-    # clicar els botons habituals (best-effort, no crític si falla).
-    for text in ["CONFIRM", "AGREE", "I Agree", "Acceptar", "ACCEPT ALL", "D'acord"]:
-        try:
-            loc = page.get_by_text(text, exact=True)
-            if loc.count() > 0:
-                loc.first.click(timeout=2000, force=True)
-                page.wait_for_timeout(300)
-        except Exception:
-            continue
-
-
-def scrape_calendar_playwright(categoria: str, grup: int, debug: bool = False) -> pd.DataFrame:
+def scrape_calendar_api(categoria: str, grup: int, debug: bool = False) -> pd.DataFrame:
     """Retorna un DataFrame amb els partits del grup (jugats o no) i, quan hi
-    hagi acta disponible, el seu ID.
+    hagi acta disponible, el seu ID — descarregat directament de l'API
+    interna de fcf.cat, sense navegador.
 
-    IMPORTANT (descobert amb un dump real): la pestanya "RESULTATS" només
-    mostra UNA jornada alhora (per defecte, la següent per jugar-se — NO la
-    jornada 1), amb un selector "JORNADA" (1..30) per canviar-la. Per tant
-    cal fer clic explícitament a cada número de jornada i llegir el
-    contingut renderitzat cada vegada; no n'hi ha prou amb carregar la
-    pàgina un sol cop.
-
-    Columnes retornades: jornada, local_team, away_team, date, time, venue,
-    acta_id (None si encara no s'ha jugat).
+    Columnes: jornada, local_team, away_team, date, time, venue, goals_home,
+    goals_away, acta_id (None si encara no s'ha jugat).
     """
+    empty_cols = ["jornada", "local_team", "away_team", "date", "time",
+                  "venue", "goals_home", "goals_away", "acta_id"]
     ids = get_grup_ids(categoria, grup)
-    empty_cols = ["jornada", "local_team", "away_team", "date", "time", "venue", "acta_id"]
     if ids is None:
         print(f"     ⚠️  {categoria} Grup {grup}: falta 'competicioId'/'grupId' a "
               f"GRUP_IDS — omple'l navegant fcf.cat. Saltant.")
         return pd.DataFrame(columns=empty_cols)
 
-    url = competicio_url(ids["competicioId"], ids["grupId"])
-    print(f"     🌐 Obrint {url}")
+    api_url = f"{BASE_URL}/api/competition/partidos?grupId={ids['grupId']}"
+    print(f"     🌐 Cridant API: {api_url}")
 
-    max_jornades = MAX_JORNADES.get(categoria, 30)
-    rows = []
-    all_acta_ids = set()
-
-    pw = browser = None
     try:
-        pw, browser, page = _get_playwright_page(headless=True)
-
-        console_log = []
-        page.on("console", lambda msg: console_log.append(f"[console.{msg.type}] {msg.text}"))
-        page.on("pageerror", lambda exc: console_log.append(f"[pageerror] {exc}"))
-
-        # Capturem també les peticions XHR/fetch (no imatges/estils/fonts,
-        # per no inflar el log amb soroll d'anuncis) — si en clicar una
-        # jornada la pàgina fa una crida a una API interna, la veurem aquí
-        # encara que visualment no sembli haver canviat res.
-        def _log_request(req):
-            if req.resource_type in ("xhr", "fetch"):
-                console_log.append(f"[request] {req.method} {req.url}")
-
-        def _log_response(res):
-            if res.request.resource_type in ("xhr", "fetch"):
-                console_log.append(f"[response] {res.status} {res.url}")
-
-        page.on("request", _log_request)
-        page.on("response", _log_response)
-
-        page.goto(url, timeout=60000)
-        try:
-            page.wait_for_load_state("networkidle", timeout=45000)
-        except Exception:
-            print("     ⏳ networkidle no assolit en 45s, continuo igualment")
-        page.wait_for_timeout(2000)
-        _dismiss_cookie_banner(page)
-
-        url_before = page.url
-        console_log.append(f"[diagnòstic] URL abans de clicar res: {url_before}")
-
-        # Cada jornada és un <button data-jornada="N"> — selector exacte i
-        # inequívoc, molt més fiable que buscar pel text "N" (que abans no
-        # canviava la jornada seleccionada tot i clicar-hi sense error).
-
-        debug_chunks = []
-        for jornada in range(1, max_jornades + 1):
-            if jornada <= 3:
-                console_log.append(f"----- ABANS de clicar jornada {jornada} -----")
-            ok_click = _click_jornada_button(page, jornada)
-            if jornada <= 3:
-                url_after = page.url
-                console_log.append(f"----- DESPRÉS de clicar jornada {jornada}: "
-                                    f"click_ok={ok_click}, URL: {url_after} -----")
-
-            if not ok_click:
-                print(f"     ⚠️  Jornada {jornada}: el clic no ha canviat la selecció "
-                      f"(3 nivells provats) — es continua igualment amb el que hi hagi")
-            page.wait_for_timeout(700)
-
-            if jornada == 1:
-                # Captura sempre (no només amb --debug) per poder veure d'un
-                # cop d'ull si el clic ha canviat res visualment.
-                try:
-                    page.screenshot(path=f"debug_jornada1_{categoria}_grup{grup}.png", full_page=True)
-                except Exception:
-                    pass
-
-            jornada_text = page.inner_text("body")
-            debug_chunks.append(f"\n\n===== JORNADA {jornada} =====\n{jornada_text}")
-
-            # IDs d'acta d'aquesta jornada
-            jornada_acta_ids = set()
-            for a in page.query_selector_all("a[href*='/competicio/acta/']"):
-                href = a.get_attribute("href") or ""
-                m = ACTA_LINK_RE.search(href)
-                if m:
-                    jornada_acta_ids.add(int(m.group(1)))
-            all_acta_ids |= jornada_acta_ids
-
-            # Partits d'aquesta jornada (jugats o no) via el patró de bloc
-            n_before = len(rows)
-            for m in MATCH_BLOCK_RE.finditer(jornada_text):
-                rows.append({
-                    "jornada": jornada,
-                    "local_team": m.group("home").strip(),
-                    "away_team": m.group("away").strip(),
-                    "date": m.group("date"),
-                    "time": m.group("time"),
-                    "venue": m.group("venue").strip(),
-                    "acta_id": None,  # es reconcilia amb jornada_acta_ids més avall
-                })
-            print(f"     📅 Jornada {jornada:2}: {len(rows) - n_before} partits trobats, "
-                  f"{len(jornada_acta_ids)} amb acta")
-
-        debug_path = Path(f"debug_calendari_{categoria}_grup{grup}.txt")
-        debug_path.write_text("".join(debug_chunks), encoding="utf-8")
-        print(f"     🐛 Text de depuració de totes les jornades desat a {debug_path}")
-
-        console_path = Path(f"debug_console_{categoria}_grup{grup}.txt")
-        console_path.write_text("\n".join(console_log), encoding="utf-8")
-        print(f"     🐛 Log de consola/errors JS desat a {console_path}")
-
-        if debug:
-            try:
-                page.screenshot(path=f"debug_calendari_{categoria}_grup{grup}.png", full_page=True)
-            except Exception:
-                pass
-
-        print(f"     🔗 {len(all_acta_ids)} actes trobades en total al calendari")
-
-    finally:
-        try:
-            if browser:
-                browser.close()
-        except Exception:
-            pass
-        try:
-            if pw:
-                pw.stop()
-        except Exception:
-            pass
-
-    if not rows and not all_acta_ids:
+        resp = requests.get(api_url, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        print(f"     ❌ Error cridant l'API de partits: {e}")
         return pd.DataFrame(columns=empty_cols)
 
-    df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=empty_cols)
-    # No sabem, a partir del bloc de text, quin partit concret correspon a
-    # quin ID d'acta (el bloc no inclou l'ID) — de moment deixem `acta_id`
-    # buit a `df` i afegim els IDs trobats com a files addicionals mínimes
-    # perquè el pipeline (mòdul 3) els processi igualment; com que l'acta ja
-    # ens torna equips/jornada/resultat fiables, no cal fer-hi coincidir res.
-    if all_acta_ids:
-        extra = pd.DataFrame({
-            "jornada": [None] * len(all_acta_ids),
-            "local_team": [None] * len(all_acta_ids),
-            "away_team": [None] * len(all_acta_ids),
-            "date": [None] * len(all_acta_ids),
-            "time": [None] * len(all_acta_ids),
-            "venue": [None] * len(all_acta_ids),
-            "acta_id": sorted(all_acta_ids),
+    # Desem sempre la resposta crua per poder-la inspeccionar si cal ajustar
+    # el mapeig de camps de sota.
+    try:
+        import json
+        debug_path = Path(f"debug_api_partidos_{categoria}_grup{grup}.json")
+        debug_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"     🐛 Resposta crua de l'API desada a {debug_path}")
+    except Exception:
+        pass
+
+    # La resposta pot ser una llista directa o venir dins una clau
+    # ("data", "partidos", "results"...) — provem les variants habituals.
+    partits_raw = data
+    if isinstance(data, dict):
+        for key in ("data", "partidos", "results", "items", "partits"):
+            if key in data and isinstance(data[key], list):
+                partits_raw = data[key]
+                break
+
+    if not isinstance(partits_raw, list):
+        print("     ⚠️  No he reconegut l'estructura de la resposta de l'API "
+              "(mira el fitxer debug_api_partidos_*.json) — cap partit carregat.")
+        return pd.DataFrame(columns=empty_cols)
+
+    def _get(d: dict, *keys, default=None):
+        """Prova diverses variants de nom de clau (majúscules/minúscules,
+        català/castellà) dins un mateix diccionari."""
+        for k in keys:
+            if k in d and d[k] is not None:
+                return d[k]
+        return default
+
+    rows = []
+    acta_ids = set()
+    for p in partits_raw:
+        if not isinstance(p, dict):
+            continue
+        jornada = _get(p, "jornada", "jornadaId", "roundNumber", "ronda")
+        home = _get(p, "equipLocal", "equipoLocal", "local", "homeTeam", "nomLocal")
+        away = _get(p, "equipVisitant", "equipoVisitante", "visitant", "awayTeam", "nomVisitant")
+        # Els noms d'equip poden venir com a text directe o com a objecte
+        # {"nom": "..."} / {"nombre": "..."} — cobrim ambdós casos.
+        if isinstance(home, dict):
+            home = _get(home, "nom", "nombre", "name")
+        if isinstance(away, dict):
+            away = _get(away, "nom", "nombre", "name")
+
+        date = _get(p, "data", "fecha", "date")
+        time_ = _get(p, "hora", "time")
+        venue = _get(p, "camp", "campo", "venue", "estadi")
+        if isinstance(venue, dict):
+            venue = _get(venue, "nom", "nombre", "name")
+        goals_home = _get(p, "golsLocal", "golesLocal", "homeGoals", "resultatLocal")
+        goals_away = _get(p, "golsVisitant", "golesVisitante", "awayGoals", "resultatVisitant")
+        acta_id = _get(p, "actaId", "acta_id", "idActa")
+
+        if acta_id is not None:
+            try:
+                acta_ids.add(int(acta_id))
+            except (TypeError, ValueError):
+                pass
+
+        rows.append({
+            "jornada": jornada,
+            "local_team": home,
+            "away_team": away,
+            "date": date,
+            "time": time_,
+            "venue": venue,
+            "goals_home": goals_home,
+            "goals_away": goals_away,
+            "acta_id": int(acta_id) if acta_id is not None else None,
         })
-        df = pd.concat([df, extra], ignore_index=True)
+
+    df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=empty_cols)
+    print(f"     ✅ {len(df)} partits llegits de l'API ({len(acta_ids)} amb acta)")
     return df
 
 
@@ -1184,9 +952,9 @@ def process_grup(categoria: str, grup: int, output_dir: Path, debug: bool = Fals
               f"al diccionari GRUP_IDS — saltant tot el grup.")
         return False
 
-    # 1. Calendari (Playwright) → llista d'IDs d'acta a seguir
-    print("  1/6 Descobrint calendari (navegador)...")
-    df_calendar = scrape_calendar_playwright(categoria, grup, debug=debug)
+    # 1. Calendari (API interna, sense navegador) → tots els partits + IDs d'acta
+    print("  1/6 Descarregant calendari (API)...")
+    df_calendar = scrape_calendar_api(categoria, grup, debug=debug)
     acta_ids = [int(x) for x in df_calendar["acta_id"].dropna().tolist()]
     print(f"     ✅ {len(acta_ids)} actes a processar")
 
@@ -1228,9 +996,13 @@ def process_grup(categoria: str, grup: int, output_dir: Path, debug: bool = Fals
     calendar_rows = df_calendar.dropna(subset=["local_team", "away_team"]).copy() if not df_calendar.empty else pd.DataFrame()
 
     if not calendar_rows.empty:
-        df_matches = calendar_rows[["jornada", "local_team", "away_team", "date", "venue"]].copy()
-        df_matches["goals_home"] = None
-        df_matches["goals_away"] = None
+        cols_disponibles = [c for c in ["jornada", "local_team", "away_team", "date", "venue",
+                                          "goals_home", "goals_away"] if c in calendar_rows.columns]
+        df_matches = calendar_rows[cols_disponibles].copy()
+        if "goals_home" not in df_matches.columns:
+            df_matches["goals_home"] = None
+        if "goals_away" not in df_matches.columns:
+            df_matches["goals_away"] = None
         df_matches["season"] = "2026-2027"
         df_matches["competition"] = f"{categoria.capitalize()} Catalana"
 
@@ -1241,14 +1013,18 @@ def process_grup(categoria: str, grup: int, output_dir: Path, debug: bool = Fals
                 results_lookup[key] = (r.get("goals_home"), r.get("goals_away"))
 
             def _lookup_score(row):
+                # Si l'API del calendari ja portava el resultat, el respectem;
+                # només busquem a l'acta el que encara falti.
+                if pd.notna(row.get("goals_home")) and pd.notna(row.get("goals_away")):
+                    return (row["goals_home"], row["goals_away"])
                 key = (row["jornada"], _normalize_team(row["local_team"]), _normalize_team(row["away_team"]))
-                return results_lookup.get(key, (None, None))
+                return results_lookup.get(key, (row.get("goals_home"), row.get("goals_away")))
 
             scores = df_matches.apply(_lookup_score, axis=1)
             df_matches["goals_home"] = [s[0] for s in scores]
             df_matches["goals_away"] = [s[1] for s in scores]
     elif not df_match_info.empty:
-        # Sense calendari (p. ex. Playwright no ha pogut recórrer les jornades)
+        # Sense calendari (p. ex. l'API de partits no ha retornat res)
         # però amb actes: com a mínim guardem els partits jugats trobats.
         df_matches = df_match_info.rename(columns={"home_team": "local_team"}).copy()
         if "venue" not in df_matches.columns:
