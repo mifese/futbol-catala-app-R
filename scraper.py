@@ -396,6 +396,11 @@ def scrape_calendar_playwright(categoria: str, grup: int, debug: bool = False) -
     pw = browser = None
     try:
         pw, browser, page = _get_playwright_page(headless=True)
+
+        console_log = []
+        page.on("console", lambda msg: console_log.append(f"[console.{msg.type}] {msg.text}"))
+        page.on("pageerror", lambda exc: console_log.append(f"[pageerror] {exc}"))
+
         page.goto(url, timeout=60000)
         try:
             page.wait_for_load_state("networkidle", timeout=45000)
@@ -404,6 +409,9 @@ def scrape_calendar_playwright(categoria: str, grup: int, debug: bool = False) -
         page.wait_for_timeout(2000)
         _dismiss_cookie_banner(page)
 
+        url_before = page.url
+        console_log.append(f"[diagnòstic] URL abans de clicar res: {url_before}")
+
         # Cada jornada és un <button data-jornada="N"> — selector exacte i
         # inequívoc, molt més fiable que buscar pel text "N" (que abans no
         # canviava la jornada seleccionada tot i clicar-hi sense error).
@@ -411,6 +419,10 @@ def scrape_calendar_playwright(categoria: str, grup: int, debug: bool = False) -
         debug_chunks = []
         for jornada in range(1, max_jornades + 1):
             ok_click = _click_jornada_button(page, jornada)
+            if jornada in (1, 3):
+                url_after = page.url
+                console_log.append(f"[diagnòstic] Jornada {jornada}: click_ok={ok_click}, URL després: {url_after}")
+
             if not ok_click:
                 print(f"     ⚠️  Jornada {jornada}: el clic no ha canviat la selecció "
                       f"(3 nivells provats) — es continua igualment amb el que hi hagi")
@@ -454,6 +466,11 @@ def scrape_calendar_playwright(categoria: str, grup: int, debug: bool = False) -
         debug_path = Path(f"debug_calendari_{categoria}_grup{grup}.txt")
         debug_path.write_text("".join(debug_chunks), encoding="utf-8")
         print(f"     🐛 Text de depuració de totes les jornades desat a {debug_path}")
+
+        console_path = Path(f"debug_console_{categoria}_grup{grup}.txt")
+        console_path.write_text("\n".join(console_log), encoding="utf-8")
+        print(f"     🐛 Log de consola/errors JS desat a {console_path}")
+
         if debug:
             try:
                 page.screenshot(path=f"debug_calendari_{categoria}_grup{grup}.png", full_page=True)
