@@ -401,6 +401,21 @@ def scrape_calendar_playwright(categoria: str, grup: int, debug: bool = False) -
         page.on("console", lambda msg: console_log.append(f"[console.{msg.type}] {msg.text}"))
         page.on("pageerror", lambda exc: console_log.append(f"[pageerror] {exc}"))
 
+        # Capturem també les peticions XHR/fetch (no imatges/estils/fonts,
+        # per no inflar el log amb soroll d'anuncis) — si en clicar una
+        # jornada la pàgina fa una crida a una API interna, la veurem aquí
+        # encara que visualment no sembli haver canviat res.
+        def _log_request(req):
+            if req.resource_type in ("xhr", "fetch"):
+                console_log.append(f"[request] {req.method} {req.url}")
+
+        def _log_response(res):
+            if res.request.resource_type in ("xhr", "fetch"):
+                console_log.append(f"[response] {res.status} {res.url}")
+
+        page.on("request", _log_request)
+        page.on("response", _log_response)
+
         page.goto(url, timeout=60000)
         try:
             page.wait_for_load_state("networkidle", timeout=45000)
@@ -418,10 +433,13 @@ def scrape_calendar_playwright(categoria: str, grup: int, debug: bool = False) -
 
         debug_chunks = []
         for jornada in range(1, max_jornades + 1):
+            if jornada <= 3:
+                console_log.append(f"----- ABANS de clicar jornada {jornada} -----")
             ok_click = _click_jornada_button(page, jornada)
-            if jornada in (1, 3):
+            if jornada <= 3:
                 url_after = page.url
-                console_log.append(f"[diagnòstic] Jornada {jornada}: click_ok={ok_click}, URL després: {url_after}")
+                console_log.append(f"----- DESPRÉS de clicar jornada {jornada}: "
+                                    f"click_ok={ok_click}, URL: {url_after} -----")
 
             if not ok_click:
                 print(f"     ⚠️  Jornada {jornada}: el clic no ha canviat la selecció "
