@@ -35,8 +35,6 @@ jobs:
           python-version: "3.11"
           cache: "pip"
       - run: pip install -r requirements.txt
-      - name: Instal·lar navegador Chromium (Playwright)
-        run: python -m playwright install --with-deps chromium
 
       - name: Scraping Tercera Catalana
         env:
@@ -64,11 +62,7 @@ jobs:
         with:
           name: debug-tercera-${{ github.run_number }}
           path: |
-            debug_calendari_*.txt
-            debug_calendari_*.png
-            debug_dom_jornada_*.html
-            debug_jornada1_*.png
-            debug_console_*.txt
+            debug_api_partidos_*.json
           retention-days: 14
           if-no-files-found: ignore
 
@@ -88,8 +82,6 @@ jobs:
           python-version: "3.11"
           cache: "pip"
       - run: pip install -r requirements.txt
-      - name: Instal·lar navegador Chromium (Playwright)
-        run: python -m playwright install --with-deps chromium
 
       - name: Scraping Segona Catalana
         env:
@@ -117,11 +109,7 @@ jobs:
         with:
           name: debug-segona-${{ github.run_number }}
           path: |
-            debug_calendari_*.txt
-            debug_calendari_*.png
-            debug_dom_jornada_*.html
-            debug_jornada1_*.png
-            debug_console_*.txt
+            debug_api_partidos_*.json
           retention-days: 14
           if-no-files-found: ignore
 
@@ -141,8 +129,6 @@ jobs:
           python-version: "3.11"
           cache: "pip"
       - run: pip install -r requirements.txt
-      - name: Instal·lar navegador Chromium (Playwright)
-        run: python -m playwright install --with-deps chromium
 
       - name: Scraping Primera Catalana
         env:
@@ -170,11 +156,7 @@ jobs:
         with:
           name: debug-primera-${{ github.run_number }}
           path: |
-            debug_calendari_*.txt
-            debug_calendari_*.png
-            debug_dom_jornada_*.html
-            debug_jornada1_*.png
-            debug_console_*.txt
+            debug_api_partidos_*.json
           retention-days: 14
           if-no-files-found: ignore
 
