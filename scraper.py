@@ -231,57 +231,65 @@ def scrape_calendar_api(categoria: str, grup: int, debug: bool = False) -> pd.Da
     except Exception:
         pass
 
-    # La resposta pot ser una llista directa o venir dins una clau
-    # ("data", "partidos", "results"...) — provem les variants habituals.
-    partits_raw = data
-    if isinstance(data, dict):
-        for key in ("data", "partidos", "results", "items", "partits"):
-            if key in data and isinstance(data[key], list):
-                partits_raw = data[key]
-                break
-
-    if not isinstance(partits_raw, list):
+    # ESTRUCTURA REAL confirmada (gràcies al bolcat de depuració d'una
+    # execució real): la resposta és un diccionari on cada clau és el
+    # número de jornada ("1".."30") i el valor la llista de partits
+    # d'aquella jornada, amb camps en castellà/majúscules:
+    #   JORNADA, CODACTA, NOMBRE_CASA, NOMBRE_FUERA, CAMPO,
+    #   GOLES_CASA, GOLES_FUERA, COMIENZO1 ("YYYY-MM-DD HH:MM:SS"),
+    #   CERRADA ("1" si l'acta ja està tancada i es pot consultar, "0" si
+    #   no — CODACTA hi és SEMPRE, fins i tot per a partits encara no
+    #   jugats, així que NOMÉS considerem l'acta disponible quan
+    #   CERRADA == "1".
+    if not isinstance(data, dict):
         print("     ⚠️  No he reconegut l'estructura de la resposta de l'API "
               "(mira el fitxer debug_api_partidos_*.json) — cap partit carregat.")
         return pd.DataFrame(columns=empty_cols)
 
-    def _get(d: dict, *keys, default=None):
-        """Prova diverses variants de nom de clau (majúscules/minúscules,
-        català/castellà) dins un mateix diccionari."""
-        for k in keys:
-            if k in d and d[k] is not None:
-                return d[k]
-        return default
+    partits_raw = []
+    for jornada_key, partits_jornada in data.items():
+        if isinstance(partits_jornada, list):
+            partits_raw.extend(partits_jornada)
+
+    if not partits_raw:
+        print("     ⚠️  L'API no ha retornat cap partit (mira el fitxer "
+              "debug_api_partidos_*.json) — cap partit carregat.")
+        return pd.DataFrame(columns=empty_cols)
+
+    def _to_int(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
 
     rows = []
     acta_ids = set()
     for p in partits_raw:
         if not isinstance(p, dict):
             continue
-        jornada = _get(p, "jornada", "jornadaId", "roundNumber", "ronda")
-        home = _get(p, "equipLocal", "equipoLocal", "local", "homeTeam", "nomLocal")
-        away = _get(p, "equipVisitant", "equipoVisitante", "visitant", "awayTeam", "nomVisitant")
-        # Els noms d'equip poden venir com a text directe o com a objecte
-        # {"nom": "..."} / {"nombre": "..."} — cobrim ambdós casos.
-        if isinstance(home, dict):
-            home = _get(home, "nom", "nombre", "name")
-        if isinstance(away, dict):
-            away = _get(away, "nom", "nombre", "name")
 
-        date = _get(p, "data", "fecha", "date")
-        time_ = _get(p, "hora", "time")
-        venue = _get(p, "camp", "campo", "venue", "estadi")
-        if isinstance(venue, dict):
-            venue = _get(venue, "nom", "nombre", "name")
-        goals_home = _get(p, "golsLocal", "golesLocal", "homeGoals", "resultatLocal")
-        goals_away = _get(p, "golsVisitant", "golesVisitante", "awayGoals", "resultatVisitant")
-        acta_id = _get(p, "actaId", "acta_id", "idActa")
+        jornada = _to_int(p.get("JORNADA"))
+        home = p.get("NOMBRE_CASA")
+        away = p.get("NOMBRE_FUERA")
+        venue = p.get("CAMPO")
+        goals_home = _to_int(p.get("GOLES_CASA"))
+        goals_away = _to_int(p.get("GOLES_FUERA"))
 
-        if acta_id is not None:
-            try:
-                acta_ids.add(int(acta_id))
-            except (TypeError, ValueError):
-                pass
+        # COMIENZO1 ve com "YYYY-MM-DD HH:MM:SS" — el separem en data/hora.
+        date = time_ = None
+        comienzo = p.get("COMIENZO1")
+        if comienzo:
+            parts = str(comienzo).split(" ")
+            date = parts[0] if len(parts) > 0 else None
+            time_ = parts[1][:5] if len(parts) > 1 else None
+
+        # CODACTA hi és sempre (fins i tot per a partits encara no jugats);
+        # només el considerem "acta disponible" quan CERRADA == "1".
+        acta_id = None
+        if str(p.get("CERRADA")) == "1":
+            acta_id = _to_int(p.get("CODACTA"))
+            if acta_id is not None:
+                acta_ids.add(acta_id)
 
         rows.append({
             "jornada": jornada,
@@ -292,7 +300,7 @@ def scrape_calendar_api(categoria: str, grup: int, debug: bool = False) -> pd.Da
             "venue": venue,
             "goals_home": goals_home,
             "goals_away": goals_away,
-            "acta_id": int(acta_id) if acta_id is not None else None,
+            "acta_id": acta_id,
         })
 
     df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=empty_cols)
