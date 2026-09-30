@@ -638,6 +638,8 @@ def scrape_match_acta(acta_id: int, categoria: str, grup: int):
         goals      = sum(1 for _, k in p["raw_events"] if k == "gol")
         n_groga    = sum(1 for _, k in p["raw_events"] if k == "groga")
         n_vermella = sum(1 for _, k in p["raw_events"] if k == "vermella")
+        groga_mins   = [m for m, k in p["raw_events"] if k == "groga"]
+        vermella_mins = [m for m, k in p["raw_events"] if k == "vermella"]
         surt_mins  = [m for m, k in p["raw_events"] if k == "surt"]
         entra_mins = [m for m, k in p["raw_events"] if k == "entra"]
 
@@ -648,6 +650,47 @@ def scrape_match_acta(acta_id: int, categoria: str, grup: int):
 
         yellow_cards = 1 if n_groga >= 1 else 0
         red_cards = 1 if (n_vermella >= 1 or n_groga >= 2) else 0
+
+        # --- Events de targetes i substitucions (abans només s'afegien els
+        # gols; les targetes i substitucions es calculaven per a les
+        # estadístiques però mai s'afegien a la taula d'events). ---
+        for minut in groga_mins:
+            events.append({
+                "match_date": match_info.get("date"), "jornada": match_info.get("jornada"),
+                "home_team": home_team, "away_team": away_team,
+                "event_type": "Targeta Groga", "minute": minut,
+                "team": p["team"], "player": p["player"], "detail": None,
+            })
+        for minut in vermella_mins:
+            events.append({
+                "match_date": match_info.get("date"), "jornada": match_info.get("jornada"),
+                "home_team": home_team, "away_team": away_team,
+                "event_type": "Targeta Vermella", "minute": minut,
+                "team": p["team"], "player": p["player"], "detail": None,
+            })
+        if n_vermella == 0 and n_groga >= 2:
+            # Vermella per doble groga: no hi ha una insígnia vermella
+            # explícita, però la segona groga implica expulsió.
+            events.append({
+                "match_date": match_info.get("date"), "jornada": match_info.get("jornada"),
+                "home_team": home_team, "away_team": away_team,
+                "event_type": "Targeta Vermella", "minute": groga_mins[1],
+                "team": p["team"], "player": p["player"], "detail": "Doble targeta groga",
+            })
+        for minut in surt_mins:
+            events.append({
+                "match_date": match_info.get("date"), "jornada": match_info.get("jornada"),
+                "home_team": home_team, "away_team": away_team,
+                "event_type": "Substitució", "minute": minut,
+                "team": p["team"], "player": p["player"], "detail": "Surt del camp",
+            })
+        for minut in entra_mins:
+            events.append({
+                "match_date": match_info.get("date"), "jornada": match_info.get("jornada"),
+                "home_team": home_team, "away_team": away_team,
+                "event_type": "Substitució", "minute": minut,
+                "team": p["team"], "player": p["player"], "detail": "Entra en joc",
+            })
 
         lineups.append({
             "match_date": match_info.get("date"),
