@@ -42,9 +42,9 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
           if [ -n "${{ github.event.inputs.grup }}" ]; then
-            python scraper.py --categoria TERCERA --grup ${{ github.event.inputs.grup }}
+            python scraper.py --categoria TERCERA --grup ${{ github.event.inputs.grup }} --debug
           else
-            python scraper.py --categoria TERCERA
+            python scraper.py --categoria TERCERA --debug
           fi
 
       - name: Pujar artefacte Tercera
@@ -63,6 +63,7 @@ jobs:
           name: debug-tercera-${{ github.run_number }}
           path: |
             debug_api_partidos_*.json
+            debug_acta_*.txt
           retention-days: 14
           if-no-files-found: ignore
 
@@ -89,9 +90,9 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
           if [ -n "${{ github.event.inputs.grup }}" ]; then
-            python scraper.py --categoria SEGONA --grup ${{ github.event.inputs.grup }}
+            python scraper.py --categoria SEGONA --grup ${{ github.event.inputs.grup }} --debug
           else
-            python scraper.py --categoria SEGONA
+            python scraper.py --categoria SEGONA --debug
           fi
 
       - name: Pujar artefacte Segona
@@ -110,6 +111,7 @@ jobs:
           name: debug-segona-${{ github.run_number }}
           path: |
             debug_api_partidos_*.json
+            debug_acta_*.txt
           retention-days: 14
           if-no-files-found: ignore
 
@@ -136,9 +138,9 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
           if [ -n "${{ github.event.inputs.grup }}" ]; then
-            python scraper.py --categoria PRIMERA --grup ${{ github.event.inputs.grup }}
+            python scraper.py --categoria PRIMERA --grup ${{ github.event.inputs.grup }} --debug
           else
-            python scraper.py --categoria PRIMERA
+            python scraper.py --categoria PRIMERA --debug
           fi
 
       - name: Pujar artefacte Primera
@@ -157,6 +159,7 @@ jobs:
           name: debug-primera-${{ github.run_number }}
           path: |
             debug_api_partidos_*.json
+            debug_acta_*.txt
           retention-days: 14
           if-no-files-found: ignore
 
