@@ -585,7 +585,10 @@ def _extract_gols(soup, home_team, away_team, jornada, date, team_lookup=None, c
         # "Pròpia" (1.382 gols normals mal etiquetats). Ara el normal és el
         # per defecte i només és Penal/Pròpia si el text ho diu (a l'span del
         # nom o al del detall).
-        combined = f"{m.group(1)} {detail_txt}".upper()
+        # Només es mira la part "GOL [PENAL|EN PRÒPIA]" abans de "( EQUIP )",
+        # perquè el nom de l'equip no pugui confondre la detecció.
+        m_tip = re.match(r"\s*GOL([^()]*)", detail_txt, re.IGNORECASE)
+        combined = (m_tip.group(1) if m_tip else "").upper()
         if re.search(r"PR[OÒ]PIA", combined):
             tipus_norm = "Pròpia"
         elif "PENAL" in combined:
@@ -611,9 +614,12 @@ def _extract_gols(soup, home_team, away_team, jornada, date, team_lookup=None, c
 
 
 BREADCRUMB_RE = re.compile(r"Competici[oó]\s*/\s*([^/]+)\s*/\s*GRUP\s*(\d+)\s*/\s*Jornada\s*(\d+)", re.IGNORECASE)
-DATA_RE       = re.compile(r"Data:\s*([\d.]+)")
-HORA_RE       = re.compile(r"Hora:\s*([\d.]+)H", re.IGNORECASE)
-ESTADI_RE     = re.compile(r"Estadi:\s*(.+)")
+# El text de l'acta (get_text amb "\n") ve com "Data\n:\n19.09.2026",
+# "Hora\n:\n17.00\nH", "Estadi\n:\nCAMP..." — els ":" són en línia pròpia,
+# per això les regex antigues ("Data:") no trobaven mai res.
+DATA_RE       = re.compile(r"\bData\s*:\s*(\d{1,2})\.(\d{1,2})\.(\d{4})")
+HORA_RE       = re.compile(r"\bHora\s*:\s*(\d{1,2})[.:](\d{2})")
+ESTADI_RE     = re.compile(r"\bEstadi\s*:\s*([^\n]+)")
 
 
 def get_with_retry(url: str) -> str | None:
@@ -642,7 +648,9 @@ def get_with_retry(url: str) -> str | None:
     return None
 
 
-REFEREE_RE = re.compile(r"[ÀA]rbitre(?:\s+principal)?\s*:?\s*\n?\s*([^\n]+)", re.IGNORECASE)
+# "Àrbitres\nNOM, COGNOM\n(\nPrincipal\n)\nDelegació" (el menú de navegació
+# també té "Àrbitres" però seguit d'"Entrenadors", per això exigim "(Principal)").
+REFEREE_RE = re.compile(r"Àrbitres\s*\n([^\n]+)\n\(\s*\n\s*Principal", re.IGNORECASE)
 
 
 def scrape_match_acta(acta_id: int, categoria: str, grup: int,
@@ -705,11 +713,13 @@ def scrape_match_acta(acta_id: int, categoria: str, grup: int,
     m_hora = HORA_RE.search(text)
     m_estadi = ESTADI_RE.search(text)
     m_ref = REFEREE_RE.search(text)
-    match_info["date"] = cal.get("date") or (m_data.group(1) if m_data else None)
-    match_info["time"] = cal.get("time") or (m_hora.group(1) if m_hora else None)
+    txt_date = f"{m_data.group(3)}-{int(m_data.group(2)):02d}-{int(m_data.group(1)):02d}" if m_data else None
+    txt_time = f"{int(m_hora.group(1)):02d}:{m_hora.group(2)}" if m_hora else None
+    match_info["date"] = cal.get("date") or txt_date
+    match_info["time"] = cal.get("time") or txt_time
     match_info["venue"] = cal.get("venue") or (
         m_estadi.group(1).split("\n")[0].strip() if m_estadi else None)
-    match_info["referee"] = cal.get("referee") or (m_ref.group(1).strip() if m_ref else None)
+    match_info["referee"] = (m_ref.group(1).strip() if m_ref else None) or cal.get("referee")
 
     # Resultat: de l'acta; si no s'ha pogut llegir (5 casos a les dades) el
     # del calendari. Abans quedava NaN i després es pujava/comptava com a 0-0.
