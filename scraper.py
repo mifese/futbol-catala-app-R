@@ -203,7 +203,7 @@ def scrape_calendar_api(categoria: str, grup: int, debug: bool = False) -> pd.Da
     goals_away, acta_id (None si encara no s'ha jugat).
     """
     empty_cols = ["jornada", "local_team", "away_team", "date", "time",
-                  "venue", "goals_home", "goals_away", "acta_id"]
+                  "venue", "referee", "goals_home", "goals_away", "acta_id"]
     ids = get_grup_ids(categoria, grup)
     if ids is None:
         print(f"     ⚠️  {categoria} Grup {grup}: falta 'competicioId'/'grupId' a "
@@ -275,13 +275,25 @@ def scrape_calendar_api(categoria: str, grup: int, debug: bool = False) -> pd.Da
         goals_home = _to_int(p.get("GOLES_CASA"))
         goals_away = _to_int(p.get("GOLES_FUERA"))
 
-        # COMIENZO1 ve com "YYYY-MM-DD HH:MM:SS" — el separem en data/hora.
+        # COMIENZO1 ve com "YYYY-MM-DD HH:MM:SS" o, segons s'ha vist a les
+        # dades reals, "YYYY-MM-DDTHH:MM:SS" (amb la T d'ISO). Abans només es
+        # separava per espai, així que la data quedava sencera ("...T17:00:00")
+        # i l'hora a None. Ara admetem els dos separadors.
         date = time_ = None
         comienzo = p.get("COMIENZO1")
         if comienzo:
-            parts = str(comienzo).split(" ")
-            date = parts[0] if len(parts) > 0 else None
-            time_ = parts[1][:5] if len(parts) > 1 else None
+            m_dt = re.match(r"\s*(\d{4}-\d{2}-\d{2})(?:[T ](\d{2}:\d{2}))?", str(comienzo))
+            if m_dt:
+                date = m_dt.group(1)
+                time_ = m_dt.group(2)
+
+        # Àrbitre: no sabem el nom exacte del camp; agafem el primer que
+        # contingui "ARBIT" (ARBITRO, ARBITRO_PRINCIPAL, NOMBRE_ARBITRO...).
+        referee = None
+        for k, v in p.items():
+            if "ARBIT" in str(k).upper() and v not in (None, "", "0"):
+                referee = str(v).strip()
+                break
 
         # CODACTA hi és sempre (fins i tot per a partits encara no jugats);
         # només el considerem "acta disponible" quan CERRADA == "1".
@@ -298,6 +310,7 @@ def scrape_calendar_api(categoria: str, grup: int, debug: bool = False) -> pd.Da
             "date": date,
             "time": time_,
             "venue": venue,
+            "referee": referee,
             "goals_home": goals_home,
             "goals_away": goals_away,
             "acta_id": acta_id,
@@ -495,7 +508,56 @@ def _extract_score(soup) -> tuple:
     return None, None
 
 
-def _extract_gols(soup, home_team, away_team, jornada, date):
+def normalize_team(name):
+    """Clau de comparació d'un equip: sense la lletra de subgrup final
+    ("... A"/"... B") que el calendari afegeix i l'acta no, i en majúscules."""
+    if not isinstance(name, str):
+        return name
+    return re.sub(r"\s+[A-B]$", "", name.strip()).upper()
+
+
+def build_canon_map(df_calendar: pd.DataFrame) -> dict:
+    """{clau normalitzada -> nom oficial del calendari}. Els noms del calendari
+    (amb la lletra A/B) són els que ja fa servir matches/standings, així que
+    s'usen com a nom canònic a TOTES les taules. Si dos noms col·lisionessin
+    amb la mateixa clau no es normalitzen (no es pot decidir)."""
+    if df_calendar is None or df_calendar.empty:
+        return {}
+    names = set(df_calendar["local_team"].dropna()) | set(df_calendar["away_team"].dropna())
+    by_key = {}
+    for n in names:
+        by_key.setdefault(normalize_team(n), set()).add(n)
+    return {k: next(iter(v)) for k, v in by_key.items() if len(v) == 1}
+
+
+def _canon(name, canon_map):
+    return canon_map.get(normalize_team(name), name) if canon_map else name
+
+
+def _clean_player_name(raw: str) -> str:
+    """El text del jugador d'un gol arriba amb cua tipus "( GOL", "( GOL PENAL"
+    o "( GOL EN PRÒPIA" enganxada (vist al CSV). La traiem."""
+    return re.sub(r"\s*\(\s*GOL.*$", "", raw, flags=re.IGNORECASE).strip()
+
+
+def format_lineup_stats(goals, groga_mins, vermella_mins, entra_mins, surt_mins, minutes_played) -> str:
+    """Contingut de la columna `stats` de matches_lineups (abans sempre NULL).
+    JSON en text: {"min":90,"gols":1,"groga":[55],"vermella":[],"entra":null,"surt":70}"""
+    import json
+    return json.dumps({
+        "min": minutes_played, "gols": goals,
+        "groga": groga_mins, "vermella": vermella_mins,
+        "entra": entra_mins[0] if entra_mins else None,
+        "surt": surt_mins[0] if surt_mins else None,
+    }, ensure_ascii=False)
+
+
+def _extract_gols(soup, home_team, away_team, jornada, date, team_lookup=None, canon_map=None):
+    """team_lookup: {nom_jugador -> equip} (o None si el nom és ambigu), construït
+    amb les alineacions del mateix partit. Es fa servir per saber l'equip del
+    gol: el text de l'acta només el dona als penals i autogols, i a la resta
+    (gols normals, ~90%) sortia sempre buit."""
+    team_lookup = team_lookup or {}
     h3 = soup.find("h3", string="Gols")
     if not h3:
         return []
@@ -516,11 +578,31 @@ def _extract_gols(soup, home_team, away_team, jornada, date):
         m = re.match(r"(.+?)\s*\((\d+)['’]\)", full_name_txt)
         if not m:
             continue
-        player, minut = m.group(1).strip(), int(m.group(2))
+        player, minut = _clean_player_name(m.group(1)), int(m.group(2))
         detail_txt = detail_span.get_text(" ", strip=True)
-        m2 = re.match(r"GOL\s+(NORMAL|PENAL|EN PR[OÒ]PIA)\s*\(\s*(.+?)\s*\)", detail_txt, re.IGNORECASE)
-        tipus, equip = (m2.group(1), m2.group(2)) if m2 else (None, None)
-        tipus_norm = {"NORMAL": "Normal", "PENAL": "Penal"}.get((tipus or "").upper(), "Pròpia")
+
+        # Tipus de gol: abans, tot el que no fos "GOL PENAL" quedava com a
+        # "Pròpia" (1.382 gols normals mal etiquetats). Ara el normal és el
+        # per defecte i només és Penal/Pròpia si el text ho diu (a l'span del
+        # nom o al del detall).
+        combined = f"{m.group(1)} {detail_txt}".upper()
+        if re.search(r"PR[OÒ]PIA", combined):
+            tipus_norm = "Pròpia"
+        elif "PENAL" in combined:
+            tipus_norm = "Penal"
+        else:
+            tipus_norm = "Normal"
+
+        # Equip: 1) alineacions del partit (sempre trobat a les dades reals);
+        # 2) text de l'acta "GOL [TIPUS] ( EQUIP )" com a reserva.
+        # Per a autogols, `team` és l'equip del JUGADOR (igual que a la font);
+        # el gol compta per al rival.
+        equip = team_lookup.get(player)
+        if not equip:
+            m2 = re.search(r"GOL(?:\s+(?:NORMAL|PENAL|EN\s+PR[OÒ]PIA))?\s*\(\s*(.+?)\s*\)",
+                           detail_txt, re.IGNORECASE)
+            if m2:
+                equip = _canon(m2.group(1), canon_map)
         events.append({
             "match_date": date, "jornada": jornada, "home_team": home_team, "away_team": away_team,
             "event_type": "Gol", "minute": minut, "team": equip, "player": player, "detail": tipus_norm,
@@ -560,14 +642,26 @@ def get_with_retry(url: str) -> str | None:
     return None
 
 
-def scrape_match_acta(acta_id: int, categoria: str, grup: int):
+REFEREE_RE = re.compile(r"[ÀA]rbitre(?:\s+principal)?\s*:?\s*\n?\s*([^\n]+)", re.IGNORECASE)
+
+
+def scrape_match_acta(acta_id: int, categoria: str, grup: int,
+                      cal: dict | None = None, canon_map: dict | None = None,
+                      debug: bool = False):
     """Descarrega i interpreta l'acta d'un partit (per requests, sense navegador).
+
+    cal: fila del calendari d'aquest partit (dict amb date/time/venue/referee/
+    goals_*). La data, l'hora, l'estadi i l'àrbitre vénen d'allà perquè el text
+    de l'acta no té "Data:/Hora:/Estadi:" (les regex no trobaven res i totes
+    les dates sortien buides). canon_map: noms oficials del calendari, perquè
+    totes les taules usin el mateix nom d'equip.
 
     Retorna (match_info: dict | None, events: list[dict], lineups: list[dict], ok: bool).
     `lineups` ja porta minuts jugats / gols / targetes calculats directament
     (no cal creuar-ho amb events com a l'antic scraper — la nova web dona el
     minut de cada esdeveniment directament a la fila del jugador).
     """
+    cal = cal or {}
     url = f"{BASE_URL}/ca/competicio/acta/{acta_id}"
     html = get_with_retry(url)
     if html is None:
@@ -590,7 +684,9 @@ def scrape_match_acta(acta_id: int, categoria: str, grup: int):
     clubs = list(seen.values())
     if len(clubs) < 2:
         return None, [], [], False
-    home_team, away_team = clubs[0], clubs[1]
+    # Nom canònic (el del calendari, amb la lletra A/B) per a totes les taules.
+    home_team = _canon(clubs[0], canon_map)
+    away_team = _canon(clubs[1], canon_map)
 
     match_info = {"season": "2026-2027", "home_team": home_team, "away_team": away_team, "jornada": None}
 
@@ -598,25 +694,40 @@ def scrape_match_acta(acta_id: int, categoria: str, grup: int):
     if m_bc:
         match_info["competition"] = m_bc.group(1).strip()
         match_info["jornada"] = int(m_bc.group(3))
+    if match_info["jornada"] is None and cal.get("jornada") is not None:
+        match_info["jornada"] = int(cal["jornada"])
+    if "competition" not in match_info:
+        match_info["competition"] = f"{categoria.upper()} CATALANA"
 
+    # Data / hora / estadi / àrbitre: primer el calendari (fiable), i el text
+    # de l'acta només com a reserva.
     m_data = DATA_RE.search(text)
-    if m_data:
-        match_info["date"] = m_data.group(1)
     m_hora = HORA_RE.search(text)
-    if m_hora:
-        match_info["time"] = m_hora.group(1)
     m_estadi = ESTADI_RE.search(text)
-    if m_estadi:
-        match_info["venue"] = m_estadi.group(1).split("\n")[0].strip()
+    m_ref = REFEREE_RE.search(text)
+    match_info["date"] = cal.get("date") or (m_data.group(1) if m_data else None)
+    match_info["time"] = cal.get("time") or (m_hora.group(1) if m_hora else None)
+    match_info["venue"] = cal.get("venue") or (
+        m_estadi.group(1).split("\n")[0].strip() if m_estadi else None)
+    match_info["referee"] = cal.get("referee") or (m_ref.group(1).strip() if m_ref else None)
 
+    # Resultat: de l'acta; si no s'ha pogut llegir (5 casos a les dades) el
+    # del calendari. Abans quedava NaN i després es pujava/comptava com a 0-0.
     gh, ga = _extract_score(soup)
-    if gh is not None:
-        match_info["goals_home"], match_info["goals_away"] = gh, ga
+    if gh is None:
+        gh, ga = cal.get("goals_home"), cal.get("goals_away")
+        gh = int(gh) if pd.notna(gh) else None
+        ga = int(ga) if pd.notna(ga) else None
+    match_info["goals_home"], match_info["goals_away"] = gh, ga
 
-    # --- GOLS (estructural, per evitar duplicats mòbil/escriptori) ---
-    events = _extract_gols(soup, home_team, away_team, match_info.get("jornada"), match_info.get("date"))
+    if debug:
+        # Volcat del text net de l'acta per veure on és l'àrbitre/data, etc.
+        try:
+            Path(f"debug_acta_{categoria}_grup{grup}_{acta_id}.txt").write_text(text, encoding="utf-8")
+        except Exception:
+            pass
 
-    # --- ALINEACIONS ---
+    # --- ALINEACIONS (primer, per poder deduir l'equip dels gols) ---
     alineacions_h = soup.find_all("h3", string="Alineacions")
     suplents_h = soup.find_all("h3", string="Suplents")
     raw_players = []
@@ -626,6 +737,16 @@ def scrape_match_acta(acta_id: int, categoria: str, grup: int):
     for i, h in enumerate(suplents_h[:2]):
         team = home_team if i == 0 else away_team
         raw_players.extend(_parse_lineup_section(h, team, "Suplent"))
+
+    # nom jugador -> equip (None si el mateix nom surt als dos equips)
+    team_lookup = {}
+    for p in raw_players:
+        prev = team_lookup.get(p["player"], p["team"])
+        team_lookup[p["player"]] = p["team"] if prev == p["team"] else None
+
+    # --- GOLS (estructural, per evitar duplicats mòbil/escriptori) ---
+    events = _extract_gols(soup, home_team, away_team, match_info.get("jornada"),
+                           match_info.get("date"), team_lookup, canon_map)
 
     lineups = []
     seen_players = set()
@@ -705,6 +826,8 @@ def scrape_match_acta(acta_id: int, categoria: str, grup: int):
             "goals":      goals,
             "yellow_cards": yellow_cards,
             "red_cards":  red_cards,
+            "stats":      format_lineup_stats(goals, groga_mins, vermella_mins,
+                                              entra_mins, surt_mins, minutes_played),
         })
 
     ok = bool(home_team and away_team)
@@ -829,6 +952,9 @@ def build_team_match_stats(matches_info: pd.DataFrame,
     records = []
     for _, m in matches_info.iterrows():
         mid = m["match_id"]
+        # Sense resultat conegut no inventem un 0-0 (afectava les prediccions).
+        if pd.isna(m.get("goals_home")) or pd.isna(m.get("goals_away")):
+            continue
         for side, team, opp, gf_col, ga_col in [
             ("Home", m["home_team"], m["away_team"], "goals_home", "goals_away"),
             ("Away", m["away_team"], m["home_team"], "goals_away", "goals_home"),
@@ -898,26 +1024,85 @@ def to_python_native(val, force_int: bool = False):
     return val
 
 
+COLS_SCHEMA = {
+    # date/time a `matches`, i minuts/gols/targetes a `matches_lineups`, són
+    # columnes noves: si la taula de Supabase encara no les té, s'ometen soles
+    # (veure insert_with_column_fallback) i es mostra un avís.
+    "matches":           ["categoria","grup","season","competition","jornada","local_team","away_team","date","time","goals_home","goals_away","venue"],
+    "matches_info":      ["categoria","grup","season","competition","jornada","date","time","home_team","away_team","goals_home","goals_away","referee"],
+    "matches_events":    ["categoria","grup","match_date","jornada","home_team","away_team","event_type","minute","team","player","detail"],
+    "matches_lineups":   ["categoria","grup","match_date","jornada","home_team","away_team","team","player","shirt_number","position","stats","minutes_played","goals","yellow_cards","red_cards"],
+    "player_match_stats":["categoria","grup","match_id","jornada","match_date","player","team","starter","minutes_played","goals","yellow_cards","red_cards"],
+    "player_stats":      ["categoria","grup","player","team","matches_played","starts","total_minutes","goals","goals_per_90","cards_per_90"],
+    "standings_by_round":["categoria","grup","team","jornada","position","played","wins","draws","losses","goals_for","goals_against","goal_diff","points"],
+    "team_match_stats":  ["categoria","grup","team","match_id","jornada","match_date","opponent","home_away","goals_for","goals_against","yellow_cards","red_cards"],
+}
+
+INT_NONNULL = {"jornada","grup","goals_for","goals_against",
+               "goal_diff","points","played","wins","draws","losses","position",
+               "starter","minutes_played","goals","yellow_cards","red_cards",
+               "starts","total_minutes","matches_played"}
+# Nullable: un partit no jugat NO és 0-0 (abans goals_home/away es forçaven a 0),
+# i un dorsal desconegut no és el dorsal 0.
+INT_NULLABLE = {"minute", "goals_home", "goals_away", "shirt_number"}
+# `position` només és un enter a standings_by_round; a matches_lineups és el
+# text "Titular"/"Suplent" (abans es convertia a número -> 0 per a tothom).
+TEXT_OVERRIDES = {"matches_lineups": {"position"}}
+
+
+def build_records(df: pd.DataFrame, table_name: str) -> list:
+    """Converteix un DataFrame en registres nets per a Supabase."""
+    valid_cols = COLS_SCHEMA.get(table_name, list(df.columns))
+    df = df[[c for c in valid_cols if c in df.columns]].copy()
+    text_cols = TEXT_OVERRIDES.get(table_name, set())
+    int_nonnull = INT_NONNULL - text_cols
+    int_nullable = INT_NULLABLE - text_cols
+
+    for col in int_nonnull:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    for col in int_nullable:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    records = []
+    for row in df.to_dict(orient="records"):
+        clean = {}
+        for k, v in row.items():
+            if k in int_nonnull:
+                clean[k] = int(to_python_native(v, force_int=True) or 0)
+            elif k in int_nullable:
+                clean[k] = to_python_native(v, force_int=True)
+            else:
+                clean[k] = to_python_native(v)
+        records.append(clean)
+    return records
+
+
+def insert_with_column_fallback(client, table_name: str, records: list, chunk_size: int = 500):
+    """Insereix en blocs. Si Supabase diu que una columna no existeix
+    (PGRST204 "Could not find the 'x' column"), l'ometem i reintentem."""
+    dropped = set()
+    for i in range(0, len(records), chunk_size):
+        chunk = records[i:i + chunk_size]
+        while True:
+            payload = [{k: v for k, v in r.items() if k not in dropped} for r in chunk]
+            try:
+                client.table(table_name).insert(payload).execute()
+                break
+            except Exception as e:
+                m = re.search(r"Could not find the '([^']+)' column", str(e))
+                if m and m.group(1) not in dropped and m.group(1) in chunk[0]:
+                    dropped.add(m.group(1))
+                    print(f"    ⚠️  {table_name}: la columna '{m.group(1)}' no existeix a Supabase, s'omet")
+                    continue
+                raise
+    return dropped
+
+
 def upload_grup_to_supabase(client: Client, categoria: str, grup: int, output_dir: Path):
     """Puja els CSVs d'un grup a Supabase: esborra els registres anteriors i insereix els nous."""
     print(f"  ☁️  Pujant {categoria} Grup {grup} a Supabase...")
-
-    COLS_SCHEMA = {
-        "matches":           ["categoria","grup","season","competition","jornada","local_team","away_team","goals_home","goals_away","venue"],
-        "matches_info":      ["categoria","grup","season","competition","jornada","date","time","home_team","away_team","goals_home","goals_away","referee"],
-        "matches_events":    ["categoria","grup","match_date","jornada","home_team","away_team","event_type","minute","team","player","detail"],
-        "matches_lineups":   ["categoria","grup","match_date","jornada","home_team","away_team","team","player","shirt_number","position","stats"],
-        "player_match_stats":["categoria","grup","match_id","jornada","match_date","player","team","starter","minutes_played","goals","yellow_cards","red_cards"],
-        "player_stats":      ["categoria","grup","player","team","matches_played","starts","total_minutes","goals","goals_per_90","cards_per_90"],
-        "standings_by_round":["categoria","grup","team","jornada","position","played","wins","draws","losses","goals_for","goals_against","goal_diff","points"],
-        "team_match_stats":  ["categoria","grup","team","match_id","jornada","match_date","opponent","home_away","goals_for","goals_against","yellow_cards","red_cards"],
-    }
-
-    INT_NONNULL = {"jornada","grup","goals_home","goals_away","goals_for","goals_against",
-                   "goal_diff","points","played","wins","draws","losses","position",
-                   "starter","minutes_played","goals","yellow_cards","red_cards",
-                   "starts","total_minutes","matches_played","shirt_number"}
-    INT_NULLABLE = {"minute"}
 
     for csv_name, table_name in CSV_TABLE_MAP.items():
         csv_path = output_dir / csv_name
@@ -939,34 +1124,11 @@ def upload_grup_to_supabase(client: Client, categoria: str, grup: int, output_di
         if "grup" not in df.columns:
             df["grup"] = grup
 
-        valid_cols = COLS_SCHEMA.get(table_name, list(df.columns))
-        df = df[[c for c in valid_cols if c in df.columns]].copy()
-
-        for col in INT_NONNULL:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-        for col in INT_NULLABLE:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        records = []
-        for row in df.to_dict(orient="records"):
-            clean = {}
-            for k, v in row.items():
-                if k in INT_NONNULL:
-                    clean[k] = int(to_python_native(v, force_int=True) or 0)
-                elif k in INT_NULLABLE:
-                    native = to_python_native(v, force_int=True)
-                    clean[k] = native
-                else:
-                    clean[k] = to_python_native(v)
-            records.append(clean)
+        records = build_records(df, table_name)
 
         try:
             client.table(table_name).delete().eq("categoria", categoria).eq("grup", grup).execute()
-            chunk_size = 500
-            for i in range(0, len(records), chunk_size):
-                client.table(table_name).insert(records[i:i + chunk_size]).execute()
+            insert_with_column_fallback(client, table_name, records)
             print(f"    ✅ {table_name}: {len(records)} registres pujats")
         except Exception as e:
             print(f"    ❌ Error pujant {table_name}: {e}")
@@ -978,7 +1140,7 @@ def upload_grup_to_supabase(client: Client, categoria: str, grup: int, output_di
 
 MATCH_INFO_COLUMNS = [
     "season", "competition", "date", "time", "jornada",
-    "home_team", "away_team", "goals_home", "goals_away", "venue",
+    "home_team", "away_team", "goals_home", "goals_away", "venue", "referee",
 ]
 MATCH_EVENTS_COLUMNS = [
     "match_date", "jornada", "home_team", "away_team",
@@ -987,7 +1149,7 @@ MATCH_EVENTS_COLUMNS = [
 MATCH_LINEUPS_COLUMNS = [
     "match_date", "jornada", "home_team", "away_team",
     "team", "player", "shirt_number", "position",
-    "minutes_played", "goals", "yellow_cards", "red_cards",
+    "minutes_played", "goals", "yellow_cards", "red_cards", "stats",
 ]
 
 
@@ -1009,13 +1171,23 @@ def process_grup(categoria: str, grup: int, output_dir: Path, debug: bool = Fals
     acta_ids = [int(x) for x in df_calendar["acta_id"].dropna().tolist()]
     print(f"     ✅ {len(acta_ids)} actes a processar")
 
+    # Noms oficials (amb A/B) i fila de calendari per acta: s'usen per omplir
+    # data/hora/estadi/àrbitre i unificar els noms d'equip a totes les taules.
+    canon_map = build_canon_map(df_calendar)
+    cal_by_acta = {}
+    if not df_calendar.empty:
+        for r in df_calendar.dropna(subset=["acta_id"]).to_dict(orient="records"):
+            cal_by_acta[int(r["acta_id"])] = r
+
     # 2. Actes (requests) → match_info, events, lineups
     print("  2/6 Scraping actes de partits...")
     all_match_info, all_events, all_lineups = [], [], []
     ok = err = 0
     for i, acta_id in enumerate(acta_ids, 1):
         print(f"     [{i:3}/{len(acta_ids)}] acta {acta_id}", end="")
-        mi, ev, lu, success = scrape_match_acta(acta_id, categoria, grup)
+        mi, ev, lu, success = scrape_match_acta(
+            acta_id, categoria, grup, cal=cal_by_acta.get(acta_id),
+            canon_map=canon_map, debug=(debug and i == 1))
         if success:
             all_match_info.append(mi)
             all_events.extend(ev)
@@ -1039,15 +1211,12 @@ def process_grup(categoria: str, grup: int, output_dir: Path, debug: bool = Fals
     #    ("PENYA ESPORTIVA MONTAGUT A") que l'acta no porta.
     print("  3/6 Consolidant matches.csv...")
 
-    def _normalize_team(name):
-        if not isinstance(name, str):
-            return name
-        return re.sub(r"\s+[A-B]$", "", name.strip()).upper()
+    _normalize_team = normalize_team
 
     calendar_rows = df_calendar.dropna(subset=["local_team", "away_team"]).copy() if not df_calendar.empty else pd.DataFrame()
 
     if not calendar_rows.empty:
-        cols_disponibles = [c for c in ["jornada", "local_team", "away_team", "date", "venue",
+        cols_disponibles = [c for c in ["jornada", "local_team", "away_team", "date", "time", "venue",
                                           "goals_home", "goals_away"] if c in calendar_rows.columns]
         df_matches = calendar_rows[cols_disponibles].copy()
         if "goals_home" not in df_matches.columns:
