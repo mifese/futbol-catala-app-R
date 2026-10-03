@@ -1,7 +1,7 @@
 """
 generar_prediccions.py
 Equivalent Python del generar_prediccions.R
-Simula 10.000 lligues per grup i puja els resultats a Supabase.
+Simula 10.000 lligues per grup (vectoritzat amb numpy) i puja els resultats a Supabase.
 S'executa automàticament des del scraper.py al final de cada scraping complet.
 """
 
@@ -9,7 +9,7 @@ import pandas as pd
 import numpy as np
 from supabase import create_client, Client
 from pathlib import Path
-import os, math, warnings
+import os, re, math, warnings
 warnings.filterwarnings("ignore")
 
 N_SIMS    = 10000
@@ -55,127 +55,99 @@ def estimate_latents(tms: pd.DataFrame) -> pd.DataFrame:
     return agg.set_index("team")
 
 
-def simular_grup(tms: pd.DataFrame, mts: pd.DataFrame, std: pd.DataFrame,
-                 cat: str, grup: int) -> pd.DataFrame | None:
-    teams   = sorted(tms["team"].unique())
+def simular_grup(mts: pd.DataFrame, cat: str, grup: int) -> pd.DataFrame | None:
+    """Simula la lliga a partir NOMÉS de matches.csv (calendari complet amb
+    resultats). Abans es creuaven tres fitxers amb noms d'equip diferents
+    (standings/matches amb "... A", team_match_stats sense), així que cap
+    equip coincidia: tot sortia amb 0 punts i cap partit pendent es simulava.
+    """
+    mts = mts.dropna(subset=["local_team", "away_team"]).copy()
+    teams = sorted(set(mts["local_team"]) | set(mts["away_team"]))
     n_teams = len(teams)
     if n_teams < 4:
         return None
+    idx = {t: i for i, t in enumerate(teams)}
 
-    # Classificació actual (darrera jornada)
-    jornada_max = std["jornada"].max()
-    cur = std[std["jornada"] == jornada_max][["team","points","goals_for","goals_against"]].copy()
-    # Afegir equips que falten
-    missing = set(teams) - set(cur["team"])
-    if missing:
-        extra = pd.DataFrame({"team": list(missing), "points": 0, "goals_for": 0, "goals_against": 0})
-        cur = pd.concat([cur, extra], ignore_index=True)
-    cur = cur.set_index("team")
+    done = mts["goals_home"].notna() & mts["goals_away"].notna()
+    played, pending = mts[done], mts[~done]
 
-    # Partits pendents
-    pending = mts[mts["goals_home"].isna()][["local_team","away_team"]].values.tolist()
-    n_pend  = len(pending)
+    # Classificació actual calculada dels partits jugats
+    pts = np.zeros(n_teams); gf = np.zeros(n_teams); ga = np.zeros(n_teams)
+    rows = []
+    for r in played.itertuples():
+        h, a = idx[r.local_team], idx[r.away_team]
+        gh, gaw = float(r.goals_home), float(r.goals_away)
+        gf[h] += gh; ga[h] += gaw; gf[a] += gaw; ga[a] += gh
+        if gh > gaw: pts[h] += 3
+        elif gh < gaw: pts[a] += 3
+        else: pts[h] += 1; pts[a] += 1
+        rows.append((r.local_team, "Home", gh, gaw))
+        rows.append((r.away_team, "Away", gaw, gh))
+    games = pd.DataFrame(rows, columns=["team", "home_away", "goals_for", "goals_against"])
 
-    # Si ja acabada la lliga
-    if n_pend == 0:
-        cur_sorted = cur.sort_values(["points","goals_for"], ascending=False)
-        cur_sorted["pos"] = range(1, len(cur_sorted)+1)
+    def _rank(score_pts, score_gd, score_gf, rng):
+        # ordre: punts, diferència, gols a favor (+ soroll <1 per desempatar)
+        sc = score_pts * 1e8 + (score_gd + 1000) * 1e4 + score_gf * 10
+        if rng is not None:
+            sc = sc + rng.random(sc.shape)
+        order = np.argsort(-sc, axis=0)
+        ranks = np.empty_like(order)
+        np.put_along_axis(ranks, order, np.arange(1, n_teams + 1)[:, None] * np.ones((1, sc.shape[1]), dtype=int), axis=0)
+        return ranks
+
+    # Lliga acabada
+    if len(pending) == 0:
+        ranks = _rank(pts[:, None], (gf - ga)[:, None], gf[:, None], None)[:, 0]
         return pd.DataFrame({
-            "categoria":      cat,
-            "grup":           grup,
-            "team":           cur_sorted.index,
-            "punts_actuals":  cur_sorted["points"].astype(int),
-            "punts_esperats": cur_sorted["points"].round(2),
-            "pos_esperada":   cur_sorted["pos"].astype(float),
-            "prob_campió":    (cur_sorted["pos"] == 1).astype(float),
-            "prob_top3":      (cur_sorted["pos"] <= N_TOP).astype(float),
-            "prob_descens":   (cur_sorted["pos"] > n_teams - N_DESCENS).astype(float),
-        })
+            "categoria": cat, "grup": grup, "team": teams,
+            "punts_actuals": pts.astype(int),
+            "punts_esperats": pts.round(2),
+            "pos_esperada": ranks.astype(float),
+            "prob_campió": (ranks == 1).astype(float),
+            "prob_top3": (ranks <= N_TOP).astype(float),
+            "prob_descens": (ranks > n_teams - N_DESCENS).astype(float),
+        }).sort_values("pos_esperada").reset_index(drop=True)
 
-    # Latents
-    lat = estimate_latents(tms)
-    global_avg = tms["goals_for"].mean()
+    lat = estimate_latents(games) if not games.empty else None
+    global_avg = games[["goals_for", "goals_against"]].stack().mean() if not games.empty else 1.2
     if not np.isfinite(global_avg) or global_avg <= 0:
         global_avg = 1.2
 
     def get_lat(team, col):
-        try:
-            v = lat.loc[team, col]
-            return float(v) if np.isfinite(v) else 0.0
-        except Exception:
+        if lat is None or team not in lat.index:
             return 0.0
+        v = lat.loc[team, col]
+        return float(v) if np.isfinite(v) else 0.0
 
-    # Acumuladors
-    rng         = np.random.default_rng(42 + grup + len(cat))
-    pos_counts  = {t: np.zeros(n_teams, dtype=int) for t in teams}
-    pts_sums    = {t: 0.0 for t in teams}
-    top3_counts = {t: 0   for t in teams}
-    desc_counts = {t: 0   for t in teams}
-    camp_counts = {t: 0   for t in teams}
+    rng = np.random.default_rng(42 + grup + len(cat))
+    S = N_SIMS
+    sim_pts = np.tile(pts[:, None], (1, S))
+    sim_gd = np.tile((gf - ga)[:, None], (1, S))
+    sim_gf = np.tile(gf[:, None], (1, S))
 
-    # Pre-calcular lambdes per partits pendents
-    lambdes = []
-    for h, a in pending:
-        if h not in teams or a not in teams:
-            lambdes.append(None); continue
-        A_h = get_lat(h,"attack");  D_h = get_lat(h,"defense")
-        A_a = get_lat(a,"attack");  D_a = get_lat(a,"defense")
-        hb  = get_lat(h,"home_boost"); ap = get_lat(a,"away_pen")
-        lh  = max(0.05, math.exp(math.log(global_avg) + A_h - D_a + hb))
-        la  = max(0.05, math.exp(math.log(global_avg) + A_a - D_h - ap))
-        lambdes.append((h, a, lh, la))
+    # Simulació vectoritzada: cada partit pendent = un vector de N_SIMS gols
+    for r in pending.itertuples():
+        h, a = r.local_team, r.away_team
+        lh = max(0.05, math.exp(math.log(global_avg) + get_lat(h, "attack") - get_lat(a, "defense") + get_lat(h, "home_boost")))
+        la = max(0.05, math.exp(math.log(global_avg) + get_lat(a, "attack") - get_lat(h, "defense") - get_lat(a, "away_pen")))
+        gh = rng.poisson(lh, S); gaw = rng.poisson(la, S)
+        hi, ai = idx[h], idx[a]
+        sim_pts[hi] += 3 * (gh > gaw) + (gh == gaw)
+        sim_pts[ai] += 3 * (gh < gaw) + (gh == gaw)
+        sim_gd[hi] += gh - gaw; sim_gd[ai] += gaw - gh
+        sim_gf[hi] += gh;       sim_gf[ai] += gaw
 
-    # Monte Carlo
-    for _ in range(N_SIMS):
-        sim_pts = {t: int(cur.loc[t,"points"])       if t in cur.index else 0 for t in teams}
-        sim_gf  = {t: int(cur.loc[t,"goals_for"])    if t in cur.index else 0 for t in teams}
-        sim_gc  = {t: int(cur.loc[t,"goals_against"]) if t in cur.index else 0 for t in teams}
+    ranks = _rank(sim_pts, sim_gd, sim_gf, rng)
 
-        for entry in lambdes:
-            if entry is None: continue
-            h, a, lh, la = entry
-            gh = rng.poisson(lh)
-            ga = rng.poisson(la)
-            if gh > ga:
-                sim_pts[h] += 3
-            elif gh == ga:
-                sim_pts[h] += 1; sim_pts[a] += 1
-            else:
-                sim_pts[a] += 3
-            sim_gf[h] += gh; sim_gc[h] += ga
-            sim_gf[a] += ga; sim_gc[a] += gh
-
-        # Classificació simulada
-        sim_df = sorted(teams, key=lambda t: (-sim_pts[t], -(sim_gf[t]-sim_gc[t]), -sim_gf[t]))
-        for pos, t in enumerate(sim_df, 1):
-            pos_counts[t][pos-1] += 1
-            pts_sums[t]          += sim_pts[t]
-            if pos <= N_TOP:                  top3_counts[t] += 1
-            if pos > n_teams - N_DESCENS:     desc_counts[t] += 1
-            if pos == 1:                      camp_counts[t] += 1
-
-    # Resum
-    posicions    = np.arange(1, n_teams+1)
-    pos_esp      = {t: float(np.average(posicions, weights=pos_counts[t])) for t in teams}
-    pts_esp      = {t: round(pts_sums[t]/N_SIMS, 2) for t in teams}
-    prob_camp    = {t: round(camp_counts[t]/N_SIMS, 4) for t in teams}
-    prob_top3    = {t: round(top3_counts[t]/N_SIMS, 4) for t in teams}
-    prob_desc    = {t: round(desc_counts[t]/N_SIMS, 4) for t in teams}
-    pts_act      = {t: int(cur.loc[t,"points"]) if t in cur.index else 0 for t in teams}
-
-    df = pd.DataFrame({
-        "categoria":      cat,
-        "grup":           grup,
-        "team":           teams,
-        "punts_actuals":  [pts_act[t]   for t in teams],
-        "punts_esperats": [pts_esp[t]   for t in teams],
-        "pos_esperada":   [round(pos_esp[t],2) for t in teams],
-        "prob_campió":    [prob_camp[t] for t in teams],
-        "prob_top3":      [prob_top3[t] for t in teams],
-        "prob_descens":   [prob_desc[t] for t in teams],
+    return pd.DataFrame({
+        "categoria": cat, "grup": grup, "team": teams,
+        "punts_actuals": pts.astype(int),
+        "punts_esperats": sim_pts.mean(axis=1).round(2),
+        "pos_esperada": ranks.mean(axis=1).round(2),
+        "prob_campió": (ranks == 1).mean(axis=1).round(4),
+        "prob_top3": (ranks <= N_TOP).mean(axis=1).round(4),
+        "prob_descens": (ranks > n_teams - N_DESCENS).mean(axis=1).round(4),
     }).sort_values("pos_esperada").reset_index(drop=True)
-
-    return df
 
 
 def pujar_prediccions(client: Client, df: pd.DataFrame, cat: str, grup: int):
@@ -199,25 +171,16 @@ def generar_totes(base_dir: Path = Path("dades")):
         for grup in range(1, n_grups + 1):
             grup_dir = base_dir / cat / f"GRUP{grup}"
             f_matches = grup_dir / "matches.csv"
-            f_tms     = grup_dir / "team_match_stats.csv"
-            f_std     = grup_dir / "standings_by_round.csv"
-
-            if not (f_matches.exists() and f_tms.exists() and f_std.exists()):
+            if not f_matches.exists():
                 continue
-
             mts = pd.read_csv(f_matches)
-            tms = pd.read_csv(f_tms)
-            std = pd.read_csv(f_std)
-
-            if mts.empty or tms.empty or std.empty:
+            if mts.empty:
                 continue
-
-            # Normalitzar nom columna
             if "home_team" in mts.columns and "local_team" not in mts.columns:
                 mts = mts.rename(columns={"home_team": "local_team"})
 
             print(f"  🔮 Simulant {cat} Grup {grup}...", end=" ")
-            df = simular_grup(tms, mts, std, cat, grup)
+            df = simular_grup(mts, cat, grup)
             if df is None:
                 print("skip")
                 continue
