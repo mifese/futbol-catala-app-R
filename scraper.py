@@ -20,6 +20,7 @@ import warnings
 from pathlib import Path
 from unidecode import unidecode
 from supabase import create_client, Client
+from generar_prediccions import generar_totes as generar_prediccions
 
 warnings.filterwarnings("ignore")
 
@@ -908,6 +909,15 @@ def main():
 
     # Consolidació final
     consolidar_tot(base_output, base_output)
+
+    # Generar prediccions (Monte Carlo 10.000 simulacions per grup)
+    if not args.only_consolidar:
+        print("\n🔮 Generant prediccions de classificació...")
+        try:
+            generar_prediccions(base_output)
+        except Exception as e:
+            print(f"  ⚠️  Error generant prediccions: {e}")
+
     print("\n🎉 Scraping completat!")
 
 
