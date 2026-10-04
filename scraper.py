@@ -81,6 +81,7 @@ import pandas as pd
 import numpy as np
 from supabase import create_client, Client
 from generar_prediccions import generar_totes as generar_prediccions
+from calcular_posicions import generar_totes as calcular_posicions
 
 warnings.filterwarnings("ignore")
 
@@ -493,9 +494,21 @@ def _parse_lineup_section(header_h3, team_name: str, position_label: str):
                 kind = _classify_badge(pair)
                 if kind:
                     raw_events.append((int(minute_txt) if minute_txt else None, kind))
+        # Capità: l'acta mostra un tag "C" just després del nom (un per equip).
+        # Es busca qualsevol element de la fila amb text exacte "C" / "(C)" que no
+        # sigui el nom ni el dorsal.
+        capita = 0
+        for el in row.find_all(["span", "div", "p", "b"]):
+            if el is name_span or el is num_span:
+                continue
+            if el.find(["span", "div", "p", "b"]):   # només fulles
+                continue
+            if el.get_text(strip=True) in ("C", "(C)", "CAP", "CAP."):
+                capita = 1
+                break
         out.append({
             "team": team_name, "player": name, "shirt_number": shirt,
-            "position": position_label, "raw_events": raw_events,
+            "position": position_label, "raw_events": raw_events, "capita": capita,
         })
     return out
 
@@ -760,11 +773,17 @@ def scrape_match_acta(acta_id: int, categoria: str, grup: int,
 
     lineups = []
     seen_players = set()
+    ordre_per_grup = {}
     for p in raw_players:
         key = (p["team"], p["player"], p["position"])
         if key in seen_players:
             continue
         seen_players.add(key)
+        # Ordre dins l'acta (0 = primer de la llista). El primer titular de cada
+        # equip és el porter: és la base de calcular_posicions.py.
+        grup_key = (p["team"], p["position"])
+        ordre = ordre_per_grup.get(grup_key, 0)
+        ordre_per_grup[grup_key] = ordre + 1
 
         goals      = sum(1 for _, k in p["raw_events"] if k == "gol")
         n_groga    = sum(1 for _, k in p["raw_events"] if k == "groga")
@@ -836,6 +855,8 @@ def scrape_match_acta(acta_id: int, categoria: str, grup: int,
             "goals":      goals,
             "yellow_cards": yellow_cards,
             "red_cards":  red_cards,
+            "ordre":      ordre,
+            "capita":     int(p.get("capita") or 0),
             "stats":      format_lineup_stats(goals, groga_mins, vermella_mins,
                                               entra_mins, surt_mins, minutes_played),
         })
@@ -1041,7 +1062,7 @@ COLS_SCHEMA = {
     "matches":           ["categoria","grup","season","competition","jornada","local_team","away_team","date","time","goals_home","goals_away","venue"],
     "matches_info":      ["categoria","grup","season","competition","jornada","date","time","home_team","away_team","goals_home","goals_away","referee"],
     "matches_events":    ["categoria","grup","match_date","jornada","home_team","away_team","event_type","minute","team","player","detail"],
-    "matches_lineups":   ["categoria","grup","match_date","jornada","home_team","away_team","team","player","shirt_number","position","stats","minutes_played","goals","yellow_cards","red_cards"],
+    "matches_lineups":   ["categoria","grup","match_date","jornada","home_team","away_team","team","player","shirt_number","position","ordre","stats","minutes_played","goals","yellow_cards","red_cards","capita"],
     "player_match_stats":["categoria","grup","match_id","jornada","match_date","player","team","starter","minutes_played","goals","yellow_cards","red_cards"],
     "player_stats":      ["categoria","grup","player","team","matches_played","starts","total_minutes","goals","goals_per_90","cards_per_90"],
     "standings_by_round":["categoria","grup","team","jornada","position","played","wins","draws","losses","goals_for","goals_against","goal_diff","points"],
@@ -1051,7 +1072,7 @@ COLS_SCHEMA = {
 INT_NONNULL = {"jornada","grup","goals_for","goals_against",
                "goal_diff","points","played","wins","draws","losses","position",
                "starter","minutes_played","goals","yellow_cards","red_cards",
-               "starts","total_minutes","matches_played"}
+               "starts","total_minutes","matches_played","ordre","capita"}
 # Nullable: un partit no jugat NO és 0-0 (abans goals_home/away es forçaven a 0),
 # i un dorsal desconegut no és el dorsal 0.
 INT_NULLABLE = {"minute", "goals_home", "goals_away", "shirt_number"}
@@ -1159,7 +1180,7 @@ MATCH_EVENTS_COLUMNS = [
 MATCH_LINEUPS_COLUMNS = [
     "match_date", "jornada", "home_team", "away_team",
     "team", "player", "shirt_number", "position",
-    "minutes_played", "goals", "yellow_cards", "red_cards", "stats",
+    "minutes_played", "goals", "yellow_cards", "red_cards", "stats", "ordre", "capita",
 ]
 
 
@@ -1409,6 +1430,12 @@ def main():
             generar_prediccions(base_output)
         except Exception as e:
             print(f"  ⚠️  Error generant prediccions: {e}")
+
+        print("\n🧭 Estimant posicions dels jugadors...")
+        try:
+            calcular_posicions(base_output, upload=get_supabase_client() is not None)
+        except Exception as e:
+            print(f"  ⚠️  Error calculant posicions: {e}")
 
     print("\n🎉 Scraping completat!")
 
