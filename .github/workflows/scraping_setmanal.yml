@@ -42,9 +42,9 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
           if [ -n "${{ github.event.inputs.grup }}" ]; then
-            python scraper.py --categoria TERCERA --grup ${{ github.event.inputs.grup }}
+            python scraper.py --categoria TERCERA --grup ${{ github.event.inputs.grup }} --debug
           else
-            python scraper.py --categoria TERCERA
+            python scraper.py --categoria TERCERA --debug
           fi
 
       - name: Pujar artefacte Tercera
@@ -55,6 +55,17 @@ jobs:
           path: dades/TERCERA/
           retention-days: 90
           if-no-files-found: warn
+
+      - name: Pujar depuració calendari Tercera
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-tercera-${{ github.run_number }}
+          path: |
+            debug_api_partidos_*.json
+            debug_acta_*.txt
+          retention-days: 14
+          if-no-files-found: ignore
 
   # ============================================================
   # JOB B: Segona Catalana (6 grups)
@@ -79,9 +90,9 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
           if [ -n "${{ github.event.inputs.grup }}" ]; then
-            python scraper.py --categoria SEGONA --grup ${{ github.event.inputs.grup }}
+            python scraper.py --categoria SEGONA --grup ${{ github.event.inputs.grup }} --debug
           else
-            python scraper.py --categoria SEGONA
+            python scraper.py --categoria SEGONA --debug
           fi
 
       - name: Pujar artefacte Segona
@@ -92,6 +103,17 @@ jobs:
           path: dades/SEGONA/
           retention-days: 90
           if-no-files-found: warn
+
+      - name: Pujar depuració calendari Segona
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-segona-${{ github.run_number }}
+          path: |
+            debug_api_partidos_*.json
+            debug_acta_*.txt
+          retention-days: 14
+          if-no-files-found: ignore
 
   # ============================================================
   # JOB C: Primera Catalana (3 grups)
@@ -116,9 +138,9 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
           if [ -n "${{ github.event.inputs.grup }}" ]; then
-            python scraper.py --categoria PRIMERA --grup ${{ github.event.inputs.grup }}
+            python scraper.py --categoria PRIMERA --grup ${{ github.event.inputs.grup }} --debug
           else
-            python scraper.py --categoria PRIMERA
+            python scraper.py --categoria PRIMERA --debug
           fi
 
       - name: Pujar artefacte Primera
@@ -129,6 +151,17 @@ jobs:
           path: dades/PRIMERA/
           retention-days: 90
           if-no-files-found: warn
+
+      - name: Pujar depuració calendari Primera
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-primera-${{ github.run_number }}
+          path: |
+            debug_api_partidos_*.json
+            debug_acta_*.txt
+          retention-days: 14
+          if-no-files-found: ignore
 
   # ============================================================
   # JOB D: Consolidació — s'executa quan els 3 jobs anteriors acaben
