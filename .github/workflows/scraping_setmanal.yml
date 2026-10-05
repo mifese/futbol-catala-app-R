@@ -211,6 +211,13 @@ jobs:
             echo "⚠️ Cap dada disponible per consolidar en aquesta execució"
           fi
 
+      - name: Calcular posicions dels jugadors
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          python calcular_posicions.py --base dades
+
       - name: Pujar CSVs consolidats finals
         uses: actions/upload-artifact@v4
         with:
