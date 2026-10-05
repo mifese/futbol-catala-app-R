@@ -102,6 +102,16 @@ def carregar_lineups(base_dir: Path) -> pd.DataFrame:
         if not df.empty:
             frames.append(df)
     if not frames:
+        # Sense carpetes per grup: es prova amb el CSV consolidat (p. ex. el que
+        # es baixa de l'artefacte "dades-consolidades-N" de GitHub Actions).
+        for path in sorted(Path(base_dir).glob("consolidat_*all_matches_lineups.csv")):
+            try:
+                df = pd.read_csv(path)
+            except pd.errors.EmptyDataError:
+                continue
+            if not df.empty:
+                frames.append(df)
+    if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
 
@@ -453,6 +463,21 @@ def validar(final: pd.DataFrame, path: Path):
 # ----------------------------------------------------------------------------
 # Supabase
 # ----------------------------------------------------------------------------
+# Columnes enteres a Supabase: un 13.0 (float) es rebutja amb
+# 'invalid input syntax for type integer: "13.0"', i el dorsal és float perquè pot ser NaN.
+INT_COLS = {"grup", "dorsal", "n_partits", "n_titular", "minuts", "gols", "jornada", "ordre"}
+
+
+def _record(row: dict) -> dict:
+    out = {}
+    for k, v in row.items():
+        v = _native(v)
+        if k in INT_COLS and v is not None:
+            v = int(round(float(v)))
+        out[k] = v
+    return out
+
+
 def _native(v):
     if v is None or (isinstance(v, float) and math.isnan(v)):
         return None
@@ -486,23 +511,38 @@ def _insert(client, table, records, chunk=500):
 def pujar(final: pd.DataFrame, roles: pd.DataFrame):
     url, key = os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY")
     if not url or not key:
-        print("  ⚠️  SUPABASE_URL/KEY no definides — no es puja")
-        return
+        raise RuntimeError("SUPABASE_URL/SUPABASE_KEY no definides: no es pot pujar")
     from supabase import create_client
     client = create_client(url, key)
+    print(f"  ☁️  Pujant a {url.split('//')[-1].split('.')[0]}… ({len(final)} jugadors, {len(roles)} rols)")
     for nom, df in (("player_positions", final), ("match_roles", roles)):
         if df.empty:
+            print(f"    ⚠️  {nom}: res a pujar")
             continue
         try:
             for (cat, grup), part in df.groupby(["categoria", "grup"]):
                 client.table(nom).delete().eq("categoria", cat).eq("grup", int(grup)).execute()
-                recs = [{k: _native(v) for k, v in r.items()} for r in part.to_dict(orient="records")]
-                for r in recs:
-                    r["grup"] = int(r["grup"])
+                recs = [_record(r) for r in part.to_dict(orient="records")]
                 _insert(client, nom, recs)
-            print(f"    ✅ {nom}: {len(df)} files pujades")
         except Exception as e:
             print(f"    ❌ Error pujant {nom}: {e}")
+            if "row-level security" in str(e) or "42501" in str(e):
+                print("       → Sembla RLS: desactiva-la a la taula o fes servir la clau 'service_role'.")
+            raise
+        # Verificació: tornem a comptar el que hi ha realment a la taula.
+        try:
+            n = client.table(nom).select("id", count="exact").limit(1).execute().count
+        except Exception as e:
+            n = None
+            print(f"    ⚠️  {nom}: no s'ha pogut verificar el recompte ({e})")
+        if n is not None:
+            print(f"    ✅ {nom}: {len(df)} files enviades, {n} files a la taula")
+            if n == 0:
+                raise RuntimeError(
+                    f"{nom} segueix buida després de pujar: probablement RLS (insert acceptat però "
+                    "no visible) o una clau sense permisos. Revisa Supabase → Authentication → Policies.")
+        else:
+            print(f"    ✅ {nom}: {len(df)} files enviades")
 
 
 # ----------------------------------------------------------------------------
