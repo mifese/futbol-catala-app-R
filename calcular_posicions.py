@@ -82,8 +82,11 @@ P_ROW0_GK, P_ROW0_OUT = 0.985, 0.005   # P(1r a l'acta | porter) i | jugador de 
 FORMACIONS = {
     (4, 4, 2): 0.0, (4, 3, 3): -0.25, (4, 5, 1): -0.45,
     (3, 5, 2): -1.1, (5, 3, 2): -1.2, (5, 4, 1): -1.2, (3, 4, 3): -1.4,
-    (4, 2, 4): -2.5, (3, 6, 1): -3.0, (6, 3, 1): -3.0,
+    (4, 2, 4): -2.5,
 }
+# Quan hi ha exactament 10 jugadors de camp NOMÉS s'accepten aquestes formacions
+# (mai 1-7-2, 6-3-1, etc.). Si l'acta està incompleta (≠10 de camp) es fa servir
+# una restricció més laxa: 3-6 defenses, 2-5 migcampistes, 1-4 davanters.
 LOG_FORMACIO_DESCONEGUDA = -3.5
 MAX_D, MAX_M = 6, 7
 
@@ -269,17 +272,33 @@ def assignar_partit(logp_out: np.ndarray, prior_equip=None, pes_equip=0.0):
                     dp[i + 1, d, m + 1] = cur + logp_out[i, 1]; ch[i + 1, d, m + 1] = 1
                 if f < 5 and cur + logp_out[i, 2] > dp[i + 1, d, m]:
                     dp[i + 1, d, m] = cur + logp_out[i, 2]; ch[i + 1, d, m] = 2
-    millor, best, segon = None, NEG, NEG
-    for d in range(MAX_D + 1):
-        for m in range(MAX_M + 1):
-            f = n - d - m
-            if f < 0 or dp[n, d, m] <= NEG / 2:
-                continue
-            tot = dp[n, d, m] + _log_formacio(d, m, f, prior_equip, pes_equip)
-            if tot > best:
-                segon, best, millor = best, tot, (d, m)
-            elif tot > segon:
-                segon = tot
+    def _triar(admet):
+        millor, best, segon = None, NEG, NEG
+        for d in range(MAX_D + 1):
+            for m in range(MAX_M + 1):
+                f = n - d - m
+                if f < 0 or dp[n, d, m] <= NEG / 2 or not admet(d, m, f):
+                    continue
+                tot = dp[n, d, m] + _log_formacio(d, m, f, prior_equip, pes_equip)
+                if tot > best:
+                    segon, best, millor = best, tot, (d, m)
+                elif tot > segon:
+                    segon = tot
+        return millor, best, segon
+
+    def _estricta(d, m, f):
+        if n == 10:
+            return (d, m, f) in FORMACIONS
+        return d >= 3 and 2 <= m <= 5 and 1 <= f <= 4
+
+    def _laxa(d, m, f):
+        return d >= 2 and m >= 1 and f >= 1
+
+    millor, best, segon = _triar(_estricta)
+    if millor is None:
+        millor, best, segon = _triar(_laxa)
+    if millor is None:
+        millor, best, segon = _triar(lambda d, m, f: True)
     if millor is None:
         return np.argmax(logp_out, axis=1), None, 0.0
     d, m = millor
