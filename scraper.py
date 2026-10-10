@@ -101,6 +101,8 @@ MAX_RETRIES            = 4
 RETRY_BACKOFF          = 20
 
 BASE_URL = "https://www.fcf.cat"
+# Els escuts es serveixen des d'aquí; l'API de partits només porta el nom del fitxer (ESCUDO_CASA/ESCUDO_FUERA).
+ESCUT_BASE = "https://files.fcf.cat/escudos/clubes/escudos/"
 
 # Nombre de grups per categoria (sense canvis respecte l'any passat, verificat
 # que Tercera Grup 2 continua tenint 18 grups/30 jornades a la nova web)
@@ -263,6 +265,10 @@ def scrape_calendar_api(categoria: str, grup: int, debug: bool = False) -> pd.Da
         except (TypeError, ValueError):
             return None
 
+    def _url_escut(nom):
+        nom = str(nom or "").strip()
+        return ESCUT_BASE + nom if nom and nom.lower() not in ("none", "null", "0") else None
+
     rows = []
     acta_ids = set()
     for p in partits_raw:
@@ -315,6 +321,8 @@ def scrape_calendar_api(categoria: str, grup: int, debug: bool = False) -> pd.Da
             "goals_home": goals_home,
             "goals_away": goals_away,
             "acta_id": acta_id,
+            "escut_local": _url_escut(p.get("ESCUDO_CASA")),
+            "escut_visitant": _url_escut(p.get("ESCUDO_FUERA")),
         })
 
     df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=empty_cols)
@@ -1028,6 +1036,7 @@ CSV_TABLE_MAP = {
     "player_stats.csv":       "player_stats",
     "standings_by_round.csv": "standings_by_round",
     "team_match_stats.csv":   "team_match_stats",
+    "team_logos.csv":         "team_logos",
 }
 
 def get_supabase_client() -> Client | None:
@@ -1056,6 +1065,7 @@ def to_python_native(val, force_int: bool = False):
 
 
 COLS_SCHEMA = {
+    "team_logos":        ["categoria","grup","team","escut_url"],
     # date/time a `matches`, i minuts/gols/targetes a `matches_lineups`, són
     # columnes noves: si la taula de Supabase encara no les té, s'ometen soles
     # (veure insert_with_column_fallback) i es mostra un avís.
@@ -1295,6 +1305,22 @@ def process_grup(categoria: str, grup: int, output_dir: Path, debug: bool = Fals
     df_matches.to_csv(output_dir / "matches.csv", index=False)
     n_jugats = int(df_matches["goals_home"].notna().sum()) if not df_matches.empty else 0
     print(f"     ✅ {len(df_matches)} partits ({n_jugats} jugats)")
+
+    # Escuts dels equips (nom del fitxer que porta l'API del calendari) -> team_logos.csv
+    try:
+        logos = {}
+        if not df_calendar.empty and "escut_local" in df_calendar.columns:
+            for r in df_calendar.to_dict(orient="records"):
+                for equip, url in ((r.get("local_team"), r.get("escut_local")),
+                                   (r.get("away_team"), r.get("escut_visitant"))):
+                    if equip and url and equip not in logos:
+                        logos[equip] = url
+        pd.DataFrame([{"categoria": categoria, "grup": grup, "team": t, "escut_url": u}
+                      for t, u in sorted(logos.items())],
+                     columns=["categoria", "grup", "team", "escut_url"]).to_csv(output_dir / "team_logos.csv", index=False)
+        print(f"     🛡️  {len(logos)} escuts")
+    except Exception as e:
+        print(f"     ⚠️  No s'han pogut desar els escuts: {e}")
 
     # 4. Classificació per jornada
     print("  4/6 Classificació per jornada...")
