@@ -68,6 +68,7 @@ AVÍS SOBRE FIABILITAT:
 """
 
 import re
+import json
 import os
 import sys
 import time
@@ -868,6 +869,29 @@ def scrape_match_acta(acta_id: int, categoria: str, grup: int,
             "stats":      format_lineup_stats(goals, groga_mins, vermella_mins,
                                               entra_mins, surt_mins, minutes_played),
         })
+
+    # --- CONCILIACIÓ DE GOLS DELS JUGADORS AMB LA SECCIÓ "Gols" ---
+    # La insígnia verda de l'alineació només marca els gols normals: els penals
+    # (≈9% dels gols) no hi sortien i els golejadors perdien gols (equips amb
+    # "Sense gols registrats", golejadors amb menys gols dels que tocaven).
+    # La secció "Gols" els porta tots amb nom, així que és la font bona; els
+    # autogols (detail "Pròpia") NO compten com a gol del jugador.
+    gols_jug = {}
+    for ev in events:
+        if ev.get("detail") == "Pròpia":
+            continue
+        gols_jug[(ev.get("player"), ev.get("team"))] = gols_jug.get((ev.get("player"), ev.get("team")), 0) + 1
+    for lu in lineups:
+        n_ev = gols_jug.get((lu["player"], lu["team"]), 0)
+        if n_ev == 0 and team_lookup.get(lu["player"]) is None:
+            n_ev = gols_jug.get((lu["player"], None), 0)
+        if n_ev > lu["goals"]:
+            lu["goals"] = n_ev
+            try:
+                st = json.loads(lu["stats"]); st["gols"] = n_ev
+                lu["stats"] = json.dumps(st, ensure_ascii=False)
+            except Exception:
+                pass
 
     ok = bool(home_team and away_team)
     return (match_info if ok else None), events, lineups, ok
