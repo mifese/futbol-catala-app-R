@@ -1355,6 +1355,16 @@ def process_grup(categoria: str, grup: int, output_dir: Path, debug: bool = Fals
         return False
     acta_ids = [int(x) for x in df_calendar["acta_id"].dropna().tolist()]
     print(f"     ✅ {len(acta_ids)} actes a processar")
+    if incremental:
+        # Diagnòstic: partits de dates ja passades que el calendari encara mostra sense resultat ni acta.
+        avui = date.today().isoformat()
+        pendents = [r for r in df_calendar.to_dict(orient="records")
+                    if str(r.get("date") or "") and str(r.get("date")) < avui
+                    and (r.get("goals_home") is None or pd.isna(r.get("goals_home")))]
+        if pendents:
+            print(f"     ⚠️  {len(pendents)} partits d'hores passades sense resultat al calendari de l'API:")
+            for r in pendents[:12]:
+                print(f"        · J{r.get('jornada')} {r.get('local_team')} – {r.get('away_team')} ({r.get('date')}, acta={r.get('acta_id')})")
 
     # Noms oficials (amb A/B) i fila de calendari per acta: s'usen per omplir
     # data/hora/estadi/àrbitre i unificar els noms d'equip a totes les taules.
