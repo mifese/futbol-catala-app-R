@@ -1,0 +1,73 @@
+name: Scraping Freqüent FCF (incremental)
+
+# Manté la web al dia entre els scrapings complets setmanals.
+#  - Només baixa les actes NOVES (o amb resultat diferent) i, un cop l'hora, també les dels últims 2 dies
+#    (una acta es pot completar o corregir després del partit).
+#  - Només puja a Supabase els grups que han canviat de debò; si no hi ha res de nou, acaba en uns minuts.
+#  - Cap de setmana (quan es juga): cada 30 minuts. Entre setmana: cinc cops al dia.
+# Les hores del cron són UTC (Catalunya = UTC+1 a l'hivern, UTC+2 a l'estiu): 07–22 UTC cobreix de 8/9 del matí a la mitjanit.
+on:
+  schedule:
+    - cron: "0 7-22 * * 6,0"        # cap de setmana, a l'hora en punt: nous + últims 2 dies
+    - cron: "30 7-22 * * 6,0"       # cap de setmana, a i mitja: només actes noves
+    - cron: "20 6,10,14,18,22 * * 1-5"   # entre setmana
+  workflow_dispatch:
+    inputs:
+      refresca_dies:
+        description: "Tornar a baixar també les actes dels últims N dies (0 = només les noves)"
+        required: false
+        default: "2"
+
+# No es poden solapar dues execucions (ni amb el scraping complet setmanal): s'esperen.
+concurrency:
+  group: scraping-fcf
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  incremental:
+    name: "Scraping incremental"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: pip install -r requirements.txt
+
+      - name: Scraping incremental (tots els grups)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          PROGRAMACIO: ${{ github.event.schedule }}
+          DIES_MANUAL: ${{ github.event.inputs.refresca_dies }}
+        run: |
+          DIES=2
+          if [ "$PROGRAMACIO" = "30 7-22 * * 6,0" ]; then DIES=0; fi
+          if [ -n "$DIES_MANUAL" ]; then DIES="$DIES_MANUAL"; fi
+          echo "Refresc d'actes dels últims $DIES dies"
+          python scraper.py --incremental --refresca-dies "$DIES"
+
+      # Opcional: si defineixes el secret API_URL (p. ex. https://la-teva-api.onrender.com) el backend buida les
+      # seves memòries just després d'una actualització. Sense el secret no passa res: les memòries caduquen soles a 5 min.
+      - name: Avisar el backend perquè buidi la cache
+        if: ${{ hashFiles('dades/CANVIS') != '' }}
+        env:
+          API_URL: ${{ secrets.API_URL }}
+        run: |
+          if [ -n "$API_URL" ]; then
+            curl -fsS -m 30 -X POST "$API_URL/cache/clear" || echo "⚠️ No s'ha pogut avisar el backend (no passa res)"
+          else
+            echo "Secret API_URL no definit: el backend es refrescarà per caducitat de la cache"
+          fi
+
+      - name: Resum
+        if: always()
+        run: |
+          if [ -f dades/CANVIS ]; then echo "✅ Hi havia dades noves ($(cat dades/CANVIS))" >> $GITHUB_STEP_SUMMARY;
+          else echo "😴 Res de nou en aquesta execució" >> $GITHUB_STEP_SUMMARY; fi
