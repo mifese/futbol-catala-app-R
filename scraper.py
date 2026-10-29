@@ -65,6 +65,7 @@ AVÍS SOBRE FIABILITAT:
     python scraper.py --categoria TERCERA --grup 3 --debug  # + bolcats de depuració
     python scraper.py --categoria TERCERA                   # tota la categoria
     python scraper.py                                       # tot
+    python scraper.py --incremental                         # només actes noves/recents (ràpid; per a execucions freqüents)
 """
 
 import re
@@ -74,6 +75,7 @@ import sys
 import time
 import argparse
 import warnings
+from datetime import date, timedelta
 from pathlib import Path
 
 import requests
@@ -878,7 +880,9 @@ def scrape_match_acta(acta_id: int, categoria: str, grup: int,
     # autogols (detail "Pròpia") NO compten com a gol del jugador.
     gols_jug = {}
     for ev in events:
-        if ev.get("detail") == "Pròpia":
+        # NOMÉS gols: `events` també porta targetes i substitucions (afegides al bucle de dalt); comptar-les inflava els gols
+        # (un jugador amb 1 gol i un canvi sortia amb 2; un suplent que només entrava, amb 1).
+        if ev.get("event_type") != "Gol" or ev.get("detail") == "Pròpia":
             continue
         gols_jug[(ev.get("player"), ev.get("team"))] = gols_jug.get((ev.get("player"), ev.get("team")), 0) + 1
     for lu in lineups:
@@ -1218,7 +1222,120 @@ MATCH_LINEUPS_COLUMNS = [
 ]
 
 
-def process_grup(categoria: str, grup: int, output_dir: Path, debug: bool = False):
+
+# ============================================================================
+# MODE INCREMENTAL (execucions freqüents)
+# ----------------------------------------------------------------------------
+# El mode complet descarrega TOTES les actes de cada grup (hores). L'incremental:
+#   1. baixa el calendari (1 petició per grup),
+#   2. llegeix de Supabase el que ja hi ha del grup,
+#   3. només torna a descarregar les actes NOVES, les dels últims REFRESH_DIES dies
+#      (l'acta es pot completar/corregir després del partit) i les que no quadren
+#      amb el calendari (resultat diferent o sense alineacions),
+#   4. fusiona i reconstrueix tot igual que el mode complet,
+#   5. només PUJA el grup a Supabase si alguna cosa ha canviat de debò.
+# Si no es pot llegir res de Supabase per al grup, cau al mode complet (segur).
+# ============================================================================
+REFRESH_DIES = 3
+ULTIM_CANVI: dict = {}     # (categoria, grup) -> {"matches": bool, "lineups": bool, "pujat": bool, "actes": int}
+
+
+def _clau_partit(jornada, local, visitant):
+    try:
+        j = int(jornada)
+    except (TypeError, ValueError):
+        j = None
+    return (j, normalize_team(local), normalize_team(visitant))
+
+
+def _llegeix_taula(client, taula: str, categoria: str, grup: int) -> list:
+    """Totes les files d'un grup (paginant de 1000 en 1000: Supabase talla les respostes llargues)."""
+    out, i = [], 0
+    ordena = True
+    while True:
+        q = client.table(taula).select("*").eq("categoria", categoria).eq("grup", grup)
+        if ordena:
+            q = q.order("id")
+        try:
+            r = q.range(i, i + 999).execute().data or []
+        except Exception:
+            if ordena:                      # taula sense columna `id`: paginem igualment sense ordre explícit
+                ordena = False
+                continue
+            raise
+        if not r:                           # es continua fins a una pàgina buida: Supabase pot tallar les respostes per sota de 1000
+            return out
+        out.extend(r)
+        i += len(r)
+
+
+def _neteja_files(rows: list, taula: str) -> list:
+    cols = COLS_SCHEMA[taula]
+    net = []
+    for r in rows:
+        d = {c: r.get(c) for c in cols if c in r}
+        if isinstance(d.get("stats"), (dict, list)):
+            d["stats"] = json.dumps(d["stats"], ensure_ascii=False)
+        net.append(d)
+    return net
+
+
+def _carrega_existent(client, categoria: str, grup: int):
+    """(info, events, lineups, matches) de Supabase per al grup, o None si no es pot (o és buit)."""
+    try:
+        info = _neteja_files(_llegeix_taula(client, "matches_info", categoria, grup), "matches_info")
+        ev = _neteja_files(_llegeix_taula(client, "matches_events", categoria, grup), "matches_events")
+        lu = _neteja_files(_llegeix_taula(client, "matches_lineups", categoria, grup), "matches_lineups")
+        ma = _neteja_files(_llegeix_taula(client, "matches", categoria, grup), "matches")
+    except Exception as e:
+        print(f"     ⚠️  No s'ha pogut llegir l'existent de Supabase ({e}) — mode complet")
+        return None
+    if not info or not lu:
+        print("     ⚠️  Supabase no té dades d'aquest grup — mode complet")
+        return None
+    return info, ev, lu, ma
+
+
+def _nv(v):
+    """Valor normalitzat per comparar dades pròpies amb les de Supabase."""
+    if v is None:
+        return None
+    if isinstance(v, (float, np.floating)) and np.isnan(v):
+        return None
+    if isinstance(v, (bool, np.bool_)):
+        return float(int(v))
+    if isinstance(v, (int, float, np.integer, np.floating)):
+        return round(float(v), 4)
+    t = str(v).strip()
+    if t == "" or t.lower() in ("nan", "none"):
+        return None
+    try:
+        return round(float(t), 4)
+    except ValueError:
+        return t
+
+
+def _signatura(rows: list, cols: list) -> list:
+    return sorted((tuple(_nv(r.get(c)) for c in cols) for r in rows), key=lambda x: tuple("" if v is None else str(v) for v in x))
+
+
+def _iguals(nous: list, vells: list, taula: str) -> bool:
+    """Mateix contingut (ignorant l'ordre i les columnes que Supabase no té)?"""
+    if len(nous) != len(vells):
+        return False
+    if not vells:
+        return True
+    comunes = [c for c in COLS_SCHEMA[taula] if c not in ("categoria", "grup") and c in vells[0]]
+    return _signatura(nous, comunes) == _signatura(vells, comunes)
+
+
+def _a_files(df) -> list:
+    if df is None or len(df) == 0:
+        return []
+    return df.to_dict(orient="records")
+
+
+def process_grup(categoria: str, grup: int, output_dir: Path, debug: bool = False, incremental: bool = False):
     """Executa el pipeline sencer per a un grup i guarda els CSVs."""
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"\n{'='*70}")
@@ -1233,6 +1350,9 @@ def process_grup(categoria: str, grup: int, output_dir: Path, debug: bool = Fals
     # 1. Calendari (API interna, sense navegador) → tots els partits + IDs d'acta
     print("  1/6 Descarregant calendari (API)...")
     df_calendar = scrape_calendar_api(categoria, grup, debug=debug)
+    if incremental and df_calendar.empty:
+        print("  ⚠️  Calendari buit (error de l'API?): no es toca res d'aquest grup en mode incremental")
+        return False
     acta_ids = [int(x) for x in df_calendar["acta_id"].dropna().tolist()]
     print(f"     ✅ {len(acta_ids)} actes a processar")
 
@@ -1245,11 +1365,43 @@ def process_grup(categoria: str, grup: int, output_dir: Path, debug: bool = Fals
             cal_by_acta[int(r["acta_id"])] = r
 
     # 2. Actes (requests) → match_info, events, lineups
-    print("  2/6 Scraping actes de partits...")
+    existent = None
+    if incremental:
+        client_r = get_supabase_client()
+        existent = _carrega_existent(client_r, categoria, grup) if client_r else None
     all_match_info, all_events, all_lineups = [], [], []
     ok = err = 0
-    for i, acta_id in enumerate(acta_ids, 1):
-        print(f"     [{i:3}/{len(acta_ids)}] acta {acta_id}", end="")
+    if existent is not None:
+        info_ex, ev_ex, lu_ex, ma_ex = existent
+        previ = {_clau_partit(r.get("jornada"), r.get("home_team"), r.get("away_team")): r for r in info_ex}
+        amb_lu = {_clau_partit(r.get("jornada"), r.get("home_team"), r.get("away_team")) for r in lu_ex}
+        limit = (date.today() - timedelta(days=REFRESH_DIES)).isoformat()      # només s'usa si REFRESH_DIES > 0
+        a_baixar, mantingudes = [], set()
+        for acta_id in acta_ids:
+            cal = cal_by_acta.get(acta_id) or {}
+            k = _clau_partit(cal.get("jornada"), cal.get("local_team"), cal.get("away_team"))
+            p = previ.get(k)
+            recent = REFRESH_DIES > 0 and bool(cal.get("date")) and str(cal.get("date")) >= limit
+            gh, ga = cal.get("goals_home"), cal.get("goals_away")
+            difereix = (p is not None and pd.notna(gh) and pd.notna(ga) and
+                        (_nv(p.get("goals_home")), _nv(p.get("goals_away"))) != (_nv(gh), _nv(ga)))
+            if p is None or k not in amb_lu or recent or difereix:
+                a_baixar.append(acta_id)
+            else:
+                mantingudes.add(k)
+        print(f"  2/6 Mode incremental: {len(a_baixar)} actes per (re)baixar, {len(mantingudes)} ja a Supabase")
+        # files de Supabase que es mantenen (només de partits que segueixen al calendari amb acta)
+        all_match_info = [r for r in info_ex if _clau_partit(r.get("jornada"), r.get("home_team"), r.get("away_team")) in mantingudes]
+        all_events = [r for r in ev_ex if _clau_partit(r.get("jornada"), r.get("home_team"), r.get("away_team")) in mantingudes]
+        all_lineups = [r for r in lu_ex if _clau_partit(r.get("jornada"), r.get("home_team"), r.get("away_team")) in mantingudes]
+        n_total = len(a_baixar)
+        llista_actes = a_baixar
+    else:
+        print("  2/6 Scraping actes de partits...")
+        n_total = len(acta_ids)
+        llista_actes = acta_ids
+    for i, acta_id in enumerate(llista_actes, 1):
+        print(f"     [{i:3}/{n_total}] acta {acta_id}", end="")
         mi, ev, lu, success = scrape_match_acta(
             acta_id, categoria, grup, cal=cal_by_acta.get(acta_id),
             canon_map=canon_map, debug=(debug and i == 1))
@@ -1259,6 +1411,15 @@ def process_grup(categoria: str, grup: int, output_dir: Path, debug: bool = Fals
             all_lineups.extend(lu)
             ok += 1
             print(f" ✅ {mi.get('home_team')} {mi.get('goals_home')}-{mi.get('goals_away')} {mi.get('away_team')}")
+        elif existent is not None:
+            # l'acta no s'ha pogut baixar: es conserva el que hi havia (si hi havia res) en lloc de perdre el partit
+            cal = cal_by_acta.get(acta_id) or {}
+            k = _clau_partit(cal.get("jornada"), cal.get("local_team"), cal.get("away_team"))
+            all_match_info += [r for r in info_ex if _clau_partit(r.get("jornada"), r.get("home_team"), r.get("away_team")) == k]
+            all_events += [r for r in ev_ex if _clau_partit(r.get("jornada"), r.get("home_team"), r.get("away_team")) == k]
+            all_lineups += [r for r in lu_ex if _clau_partit(r.get("jornada"), r.get("home_team"), r.get("away_team")) == k]
+            err += 1
+            print(" ❌ (es conserva l'anterior)")
         else:
             err += 1
             print(" ❌")
@@ -1359,10 +1520,15 @@ def process_grup(categoria: str, grup: int, output_dir: Path, debug: bool = Fals
         (df_lineups,    output_dir / "all_matches_lineups.csv"),
     ]:
         if not df_ref.empty:
+            # sempre es (re)escriuen: en mode incremental hi ha files de Supabase (amb categoria/grup) barrejades amb les noves (sense)
             if "categoria" not in df_ref.columns:
                 df_ref.insert(0, "categoria", categoria)
+            else:
+                df_ref["categoria"] = categoria
             if "grup" not in df_ref.columns:
                 df_ref.insert(1, "grup", grup)
+            else:
+                df_ref["grup"] = grup
         df_ref.to_csv(path, index=False)
 
     # 5. Estadístiques de jugadors (dependent de lineups — de moment buit,
@@ -1381,8 +1547,23 @@ def process_grup(categoria: str, grup: int, output_dir: Path, debug: bool = Fals
     print(f"  💾 Fitxers guardats a: {output_dir}")
 
     supabase = get_supabase_client()
-    if supabase:
+    canvi_m = canvi_l = True
+    if existent is not None:
+        canvi_m = not (_iguals(_a_files(df_matches), existent[3], "matches") and
+                       _iguals(_a_files(df_match_info), existent[0], "matches_info"))
+        canvi_l = not (_iguals(_a_files(df_events), existent[1], "matches_events") and
+                       _iguals(_a_files(df_lineups), existent[2], "matches_lineups"))
+    ULTIM_CANVI[(categoria, grup)] = {"matches": canvi_m, "lineups": canvi_l, "pujat": False,
+                                      "actes": len(llista_actes) if existent is not None else len(acta_ids)}
+    if existent is not None and len(df_match_info) < len(existent[0]):
+        # mai no es redueix un grup en incremental: és senyal que alguna cosa ha fallat (calendari parcial, actes caigudes...)
+        print(f"  ⚠️  Només {len(df_match_info)} actes vs {len(existent[0])} a Supabase — no es puja (es conserva l'anterior)")
+        ULTIM_CANVI[(categoria, grup)]["matches"] = ULTIM_CANVI[(categoria, grup)]["lineups"] = False
+    elif existent is not None and not (canvi_m or canvi_l):
+        print("  ✅ Sense canvis respecte a Supabase — no es puja res")
+    elif supabase:
         upload_grup_to_supabase(supabase, categoria, grup, output_dir)
+        ULTIM_CANVI[(categoria, grup)]["pujat"] = True
 
     return True
 
@@ -1439,6 +1620,7 @@ def consolidar_tot(base_dir: Path, output_dir: Path):
 # ============================================================================
 
 def main():
+    global REFRESH_DIES
     parser = argparse.ArgumentParser(description="Scraper FCF — Futbol Català (nova web)")
     parser.add_argument("--categoria", choices=list(CATEGORIES.keys()),
                         help="Processa només aquesta categoria")
@@ -1448,11 +1630,18 @@ def main():
                         help="Directori de sortida base (default: dades/)")
     parser.add_argument("--only-consolidar", action="store_true",
                         help="Només fa la consolidació final sense scraping")
+    parser.add_argument("--incremental", action="store_true",
+                        help="Només descarrega actes noves/recents i puja només els grups que han canviat (execucions freqüents)")
+    parser.add_argument("--refresca-dies", type=int, default=None,
+                        help="(només amb --incremental) Torna a baixar també les actes dels últims N dies (0 = només les noves "
+                             "o amb resultat diferent; per defecte %d)" % REFRESH_DIES)
     parser.add_argument("--debug", action="store_true",
                         help="Desa bolcats de depuració (text del calendari renderitzat)")
     args = parser.parse_args()
 
     base_output = Path(args.output)
+    if args.refresca_dies is not None:
+        REFRESH_DIES = max(0, args.refresca_dies)
 
     if args.only_consolidar:
         consolidar_tot(base_output, base_output)
@@ -1461,16 +1650,45 @@ def main():
 
     if args.categoria and args.grup:
         out = base_output / args.categoria / f"GRUP{args.grup}"
-        process_grup(args.categoria, args.grup, out, debug=args.debug)
+        process_grup(args.categoria, args.grup, out, debug=args.debug, incremental=args.incremental)
     elif args.categoria:
         for grup in range(1, CATEGORIES[args.categoria] + 1):
             out = base_output / args.categoria / f"GRUP{grup}"
-            process_grup(args.categoria, grup, out, debug=args.debug)
+            process_grup(args.categoria, grup, out, debug=args.debug, incremental=args.incremental)
     else:
         for categoria, num_grups in CATEGORIES.items():
             for grup in range(1, num_grups + 1):
                 out = base_output / categoria / f"GRUP{grup}"
-                process_grup(categoria, grup, out, debug=args.debug)
+                process_grup(categoria, grup, out, debug=args.debug, incremental=args.incremental)
+
+    if args.incremental:
+        pujats = [k for k, v in ULTIM_CANVI.items() if v["pujat"]]
+        ch_m = any(v["matches"] for v in ULTIM_CANVI.values())
+        ch_l = any(v["lineups"] for v in ULTIM_CANVI.values())
+        print(f"\n📊 Incremental: {len(ULTIM_CANVI)} grups revisats, {len(pujats)} amb canvis: "
+              + (", ".join(f"{c} G{g}" for c, g in pujats) or "cap"))
+        if not pujats and not ch_m and not ch_l:
+            print("😴 Res de nou: no cal consolidar, ni recalcular prediccions ni posicions.")
+            return
+        consolidar_tot(base_output, base_output)
+        try:       # marca per al workflow (p. ex. per avisar el backend que buidi la cache)
+            (base_output / "CANVIS").write_text(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), encoding="utf-8")
+        except Exception:
+            pass
+        if ch_m:
+            print("\n🔮 Generant prediccions de classificació...")
+            try:
+                generar_prediccions(base_output)
+            except Exception as e:
+                print(f"  ⚠️  Error generant prediccions: {e}")
+        if ch_l:
+            print("\n🧭 Estimant posicions dels jugadors...")
+            try:
+                calcular_posicions(base_output, upload=get_supabase_client() is not None)
+            except Exception as e:
+                print(f"  ⚠️  Error calculant posicions: {e}")
+        print("\n🎉 Scraping incremental completat!")
+        return
 
     consolidar_tot(base_output, base_output)
 
