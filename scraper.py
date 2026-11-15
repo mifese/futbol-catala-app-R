@@ -99,6 +99,16 @@ HEADERS        = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
 }
+# Capçaleres que envia un Chrome real: CloudFront (davant de fcf.cat) sol rebutjar (403) les peticions que només duen User-Agent.
+HEADERS_API = {
+    **HEADERS,
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "ca-ES,ca;q=0.9,es;q=0.8,en;q=0.7",
+    "Referer": "https://www.fcf.cat/ca/competicio",
+    "Origin": "https://www.fcf.cat",
+    "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-origin",
+}
+API_ERRORS = {"n": 0, "ultim": ""}      # peticions de calendari fallades (per fer acabar el procés en vermell)
 SLEEP_BETWEEN_REQUESTS = 1.5    # segons entre peticions d'actes (respecta el servidor)
 MAX_RETRIES            = 4
 RETRY_BACKOFF          = 20
@@ -219,12 +229,26 @@ def scrape_calendar_api(categoria: str, grup: int, debug: bool = False) -> pd.Da
     api_url = f"{BASE_URL}/api/competition/partidos?grupId={ids['grupId']}"
     print(f"     🌐 Cridant API: {api_url}")
 
-    try:
-        resp = requests.get(api_url, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        print(f"     ❌ Error cridant l'API de partits: {e}")
+    data, err = None, None
+    for intent in range(1, 4):
+        try:
+            resp = requests.get(api_url, headers=HEADERS_API, timeout=25)
+            if resp.status_code in (403, 429, 502, 503, 504) and intent < 3:
+                espera = 15 * intent
+                print(f"     ⏳ HTTP {resp.status_code} (intent {intent}/3), esperant {espera}s...")
+                time.sleep(espera)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        except Exception as e:
+            err = e
+            if intent < 3:
+                time.sleep(10 * intent)
+    if data is None:
+        print(f"     ❌ Error cridant l'API de partits: {err}")
+        API_ERRORS["n"] += 1
+        API_ERRORS["ultim"] = str(err)
         return pd.DataFrame(columns=empty_cols)
 
     # Desem sempre la resposta crua per poder-la inspeccionar si cal ajustar
@@ -247,6 +271,12 @@ def scrape_calendar_api(categoria: str, grup: int, debug: bool = False) -> pd.Da
     #   no — CODACTA hi és SEMPRE, fins i tot per a partits encara no
     #   jugats, així que NOMÉS considerem l'acta disponible quan
     #   CERRADA == "1".
+    # FORMAT NOU (nov. 2026): la FCF ha embolcallat la resposta com
+    #   {"partidos": {"1": [...], ...}, "jornada": {...}, "fechasJornadas": {...}}
+    # Es desembolica; el format antic (jornades directament a l'arrel) també continua funcionant.
+    if isinstance(data, dict) and isinstance(data.get("partidos"), dict):
+        data = data["partidos"]
+
     if not isinstance(data, dict):
         print("     ⚠️  No he reconegut l'estructura de la resposta de l'API "
               "(mira el fitxer debug_api_partidos_*.json) — cap partit carregat.")
@@ -1629,6 +1659,15 @@ def consolidar_tot(base_dir: Path, output_dir: Path):
 # ENTRY POINT
 # ============================================================================
 
+def _comprova_errors_api():
+    """Si l'API de la FCF ha fallat, el procés acaba amb error (vermell a GitHub Actions i exit code 1 a Windows)
+    en lloc de fer veure que tot ha anat bé: així t'assabentes el mateix dia i no dues setmanes després."""
+    if API_ERRORS["n"] > 0:
+        print(f"\n🚨 {API_ERRORS['n']} grups no s'han pogut descarregar de la FCF. Últim error: {API_ERRORS['ultim']}")
+        print("   Les dades de la web NO s'han actualitzat per a aquests grups.")
+        sys.exit(1)
+
+
 def main():
     global REFRESH_DIES
     parser = argparse.ArgumentParser(description="Scraper FCF — Futbol Català (nova web)")
@@ -1679,6 +1718,7 @@ def main():
               + (", ".join(f"{c} G{g}" for c, g in pujats) or "cap"))
         if not pujats and not ch_m and not ch_l:
             print("😴 Res de nou: no cal consolidar, ni recalcular prediccions ni posicions.")
+            _comprova_errors_api()
             return
         consolidar_tot(base_output, base_output)
         try:       # marca per al workflow (p. ex. per avisar el backend que buidi la cache)
@@ -1698,6 +1738,7 @@ def main():
             except Exception as e:
                 print(f"  ⚠️  Error calculant posicions: {e}")
         print("\n🎉 Scraping incremental completat!")
+        _comprova_errors_api()
         return
 
     consolidar_tot(base_output, base_output)
@@ -1716,6 +1757,7 @@ def main():
             print(f"  ⚠️  Error calculant posicions: {e}")
 
     print("\n🎉 Scraping completat!")
+    _comprova_errors_api()
 
 
 if __name__ == "__main__":
