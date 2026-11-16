@@ -821,7 +821,7 @@ def _jugadors_v2(soup, local, visitant):
                     if tipus is None:
                         AVISOS_ACTA.add(f"icona desconeguda a l'acta (jugador {nom_sp['title']}): {str(cella)[:160]}")
                         continue
-                    if tipus == "gol_altre":
+                    if False and tipus == "gol_altre":   # pilota d'un altre color = gol en pròpia (es tracta a l'apartat Gols)
                         AVISOS_ACTA.add(f"pilota de color desconegut a l'acta (jugador {nom_sp['title']}): {str(cella)[:160]}")
                     raw.append((int(minut) if minut else None, tipus))
             out.append({"team": equip_actual, "player": nom_sp["title"].strip(), "shirt_number": dorsal,
@@ -1934,6 +1934,7 @@ def main():
                 generar_prediccions(base_output)
             except Exception as e:
                 print(f"  ⚠️  Error generant prediccions: {e}")
+                import traceback; traceback.print_exc()
         if ch_l:
             print("\n🧭 Estimant posicions dels jugadors...")
             try:
@@ -1952,6 +1953,7 @@ def main():
             generar_prediccions(base_output)
         except Exception as e:
             print(f"  ⚠️  Error generant prediccions: {e}")
+            import traceback; traceback.print_exc()
 
         print("\n🧭 Estimant posicions dels jugadors...")
         try:
