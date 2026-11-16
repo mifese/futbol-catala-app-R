@@ -108,6 +108,14 @@ HEADERS_API = {
     "Origin": "https://www.fcf.cat",
     "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-origin",
 }
+HEADERS_PAGE = {
+    **HEADERS,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "ca-ES,ca;q=0.9,es;q=0.8,en;q=0.7",
+    "Referer": "https://www.fcf.cat/ca/competicio",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Site": "same-origin", "Sec-Fetch-User": "?1",
+}
 API_ERRORS = {"n": 0, "ultim": ""}      # peticions de calendari fallades (per fer acabar el procés en vermell)
 SLEEP_BETWEEN_REQUESTS = 1.5    # segons entre peticions d'actes (respecta el servidor)
 MAX_RETRIES            = 4
@@ -354,6 +362,7 @@ def scrape_calendar_api(categoria: str, grup: int, debug: bool = False) -> pd.Da
             "goals_home": goals_home,
             "goals_away": goals_away,
             "acta_id": acta_id,
+            "match_url": p.get("MATCH_URL"),
             "escut_local": _url_escut(p.get("ESCUDO_CASA")),
             "escut_visitant": _url_escut(p.get("ESCUDO_FUERA")),
         })
@@ -680,7 +689,7 @@ def get_with_retry(url: str) -> str | None:
     """Petició HTTP amb reintents i backoff exponencial."""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=20)
+            resp = requests.get(url, headers=HEADERS_PAGE, timeout=25)
             if resp.status_code == 503:
                 wait = RETRY_BACKOFF * (2 ** (attempt - 1))
                 print(f"    ⏳ 503 rebut (intent {attempt}/{MAX_RETRIES}), esperant {wait}s...")
@@ -707,6 +716,172 @@ def get_with_retry(url: str) -> str | None:
 REFEREE_RE = re.compile(r"Àrbitres\s*\n([^\n]+)\n\(\s*\n\s*Principal", re.IGNORECASE)
 
 
+# ============================================================================
+# ACTA — FORMAT NOU DE LA FCF (nov. 2026)
+# ----------------------------------------------------------------------------
+# /ca/competicio/acta/<id> ara només carrega l'acta amb JavaScript ("Carregant acta...") i el HTML no porta dades.
+# L'acta completa (renderitzada al servidor) és a /ca/partit/<temporada>/<categoria>/<grup>/jornada-N/<slug>, i l'URL
+# (MATCH_URL) el dona l'API del calendari. Estructura: blocs "TITULARS" / "SUPLENTS" per equip (amb una fila per jugador:
+# dorsal, nom, i una cel·la minut+icona per cada incidència) i un bloc "GOLS" amb una fila per gol (escut de l'equip que
+# suma, minut, dorsal, nom i una pilota de color).
+#   icona groga            -> targeta groga          (div #FFEB3B)
+#   pilota verda  #00FF73  -> gol normal
+#   pilota blava  #82E4FF  -> gol de penal           (suposat: només s'ha pogut contrastar amb un cas)
+#   fletxa vermella  →     -> surt del camp
+#   fletxa blava     ←     -> entra al camp
+# L'autogol es detecta per estructura (el jugador és de l'equip contrari al de l'escut del gol), no per color.
+# Qualsevol icona que no es reconegui s'avisa per pantalla en lloc d'ignorar-se en silenci.
+# ============================================================================
+AVISOS_ACTA: set = set()
+
+
+def _es_acta_v2(soup) -> bool:
+    return any(h.get_text(strip=True).upper() == "TITULARS" for h in soup.find_all("h3"))
+
+
+def _arrel_v2(soup):
+    return soup.select_one("div.hidden.lg\\:grid") or soup.select_one("div.lg\\:hidden") or soup
+
+
+def _classifica_cella_v2(cella) -> str | None:
+    h = str(cella)
+    if "#FFEB3B" in h:
+        return "groga"
+    if "#333333" in h and "<circle" in h:                       # pilota
+        if "#00FF73" in h:
+            return "gol"
+        if "#82E4FF" in h:
+            return "gol_penal"
+        return "gol_altre"
+    if "M5 12H19" in h:
+        return "surt"
+    if "M19 12H5" in h:
+        return "entra"
+    t = (cella.find(attrs={"title": True}) or {}).get("title", "") if hasattr(cella, "find") else ""
+    if re.search(r"vermell|roja|red card", str(t), re.IGNORECASE) or re.search(r"bg-red-\d|bg-\[red\]", h):
+        return "vermella"
+    # Targeta vermella = rectangle amb un color vermell (qualsevol tonalitat), sense ser una fletxa (ja descartades dalt)
+    for hx in re.findall(r"#([0-9A-Fa-f]{6})\b", h):
+        r_, g_, b_ = int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16)
+        if r_ >= 190 and g_ <= 90 and b_ <= 90:
+            return "vermella"
+    return None
+
+
+def _equips_v2(soup):
+    """(local, visitant): els dos primers enllaços de club diferents (capçalera de l'acta)."""
+    vistos = []
+    for a in soup.select("a[href*='/ca/clubs/']"):
+        t = (a.get("title") or a.get_text(strip=True) or "").strip()
+        if t and t not in vistos:
+            vistos.append(t)
+        if len(vistos) == 2:
+            break
+    return vistos
+
+
+def _marcador_v2(soup):
+    nums = [s.get_text(strip=True) for s in soup.select("span.font-bold") if s.get_text(strip=True).isdigit()
+            and "text-4xl" in " ".join(s.get("class", []))]
+    return (int(nums[0]), int(nums[1])) if len(nums) >= 2 else (None, None)
+
+
+def _jugadors_v2(soup, local, visitant):
+    """Jugadors d'ambdós equips. Retorna llista de dicts compatible amb el format antic (raw_events=[(minut, tipus)])."""
+    arrel = _arrel_v2(soup)
+    out, equip_actual, ordre_cont = [], None, 0
+    for h3 in arrel.find_all("h3"):
+        tit = h3.get_text(strip=True).upper()
+        if tit not in ("TITULARS", "SUPLENTS"):
+            continue
+        cap = h3.find_parent(["summary", "div"])
+        if tit == "TITULARS":
+            a = cap.find("a", href=re.compile(r"/ca/clubs/"))
+            equip_actual = ((a.get("title") or a.get_text(strip=True)) if a else None) or equip_actual
+        contenidor = cap.find_next_sibling("div") if cap else None
+        if contenidor is None or equip_actual is None:
+            continue
+        for fila in contenidor.find_all("div", recursive=False):
+            nom_sp = fila.find("span", attrs={"title": True})
+            if not nom_sp:
+                continue
+            fills = fila.find_all("div", recursive=False)
+            dorsal = None
+            sp0 = fila.find("span")
+            if sp0 is not None and sp0 is not nom_sp and sp0.get_text(strip=True):
+                dorsal = sp0.get_text(strip=True)
+            capita = 1 if fila.find(attrs={"title": "Capità"}) else 0
+            raw = []
+            ev_cont = fills[-1] if len(fills) >= 2 else None
+            if ev_cont is not None:
+                for cella in ev_cont.find_all("div", recursive=False):
+                    sp = cella.find("span")
+                    minut = re.sub(r"[^\d]", "", sp.get_text(strip=True)) if sp else ""
+                    tipus = _classifica_cella_v2(cella)
+                    if tipus is None:
+                        AVISOS_ACTA.add(f"icona desconeguda a l'acta (jugador {nom_sp['title']}): {str(cella)[:160]}")
+                        continue
+                    if tipus == "gol_altre":
+                        AVISOS_ACTA.add(f"pilota de color desconegut a l'acta (jugador {nom_sp['title']}): {str(cella)[:160]}")
+                    raw.append((int(minut) if minut else None, tipus))
+            out.append({"team": equip_actual, "player": nom_sp["title"].strip(), "shirt_number": dorsal,
+                        "position": "Titular" if tit == "TITULARS" else "Suplent", "raw_events": raw, "capita": capita})
+    return out
+
+
+def _gols_v2(soup, local, visitant, jornada, data, team_lookup, canon_map):
+    arrel = _arrel_v2(soup)
+    h3 = next((h for h in arrel.find_all("h3") if h.get_text(strip=True).upper() == "GOLS"), None)
+    if h3 is None:
+        return []
+    cap = h3.find_parent("div")
+    cont = cap.find_next_sibling("div") if cap else None
+    if cont is None:
+        return []
+    events = []
+    marc_ant = (0, 0)
+    for fila in cont.find_all("div", recursive=False):
+        nom_sp = fila.find("span", attrs={"title": True})
+        img = fila.find("img")
+        if not nom_sp:
+            continue
+        jugador = nom_sp["title"].strip()
+        txt_min = ""
+        for sp in fila.find_all("span"):
+            t = sp.get_text("", strip=True)
+            if re.match(r"^\(\s*\d+(\+\d+)?\s*['’]\s*\)$", t):
+                txt_min = t
+                break
+        m = re.search(r"(\d+)", txt_min)
+        minut = int(m.group(1)) if m else None
+        beneficiari = _canon(img.get("alt"), canon_map) if img is not None and img.get("alt") else None
+        equip_jug = team_lookup.get(jugador)
+        h = str(fila)
+        # Qui s'ha emportat el gol? El marcador acumulat de la fila ("0 - 1") és la font més fiable.
+        m_sc = re.search(r"(\d+)\s*-\s*(\d+)", fila.get_text(" ", strip=True))
+        if m_sc:
+            sc = (int(m_sc.group(1)), int(m_sc.group(2)))
+            if sc[0] > marc_ant[0] and sc[1] == marc_ant[1]:
+                beneficiari = local
+            elif sc[1] > marc_ant[1] and sc[0] == marc_ant[0]:
+                beneficiari = visitant
+            marc_ant = sc
+        bola_normal = "#00FF73" in h or "#82E4FF" in h
+        if equip_jug and beneficiari and normalize_team(equip_jug) != normalize_team(beneficiari):
+            tipus, equip = "Pròpia", equip_jug                      # `team` = equip del JUGADOR (com a la font original)
+        elif not equip_jug and beneficiari and not bola_normal and "#333333" in h:
+            tipus = "Pròpia"
+            equip = visitant if normalize_team(beneficiari) == normalize_team(local) else local
+        else:
+            tipus = "Penal" if "#82E4FF" in h else "Normal"
+            if not bola_normal:
+                AVISOS_ACTA.add(f"gol sense pilota verda/blava (jugador {jugador}) i sense indici de pròpia; es desa com a normal: {h[:400]}")
+            equip = equip_jug or beneficiari
+        events.append({"match_date": data, "jornada": jornada, "home_team": local, "away_team": visitant,
+                       "event_type": "Gol", "minute": minut, "team": equip, "player": jugador, "detail": tipus})
+    return events
+
+
 def scrape_match_acta(acta_id: int, categoria: str, grup: int,
                       cal: dict | None = None, canon_map: dict | None = None,
                       debug: bool = False):
@@ -725,6 +900,8 @@ def scrape_match_acta(acta_id: int, categoria: str, grup: int,
     """
     cal = cal or {}
     url = f"{BASE_URL}/ca/competicio/acta/{acta_id}"
+    if cal.get("match_url"):
+        url = BASE_URL + "/ca" + str(cal["match_url"])          # pàgina nova (renderitzada al servidor)
     html = get_with_retry(url)
     if html is None:
         return None, [], [], False
@@ -738,13 +915,18 @@ def scrape_match_acta(acta_id: int, categoria: str, grup: int,
         return None, [], [], False
 
     # Equips: primers dos enllaços únics a /ca/clubs/{id}/categories/{id}
-    seen = {}
-    for a in soup.find_all("a", href=re.compile(r"/ca/clubs/\d+/categories/\d+")):
-        t = a.get_text(strip=True)
-        if t and a["href"] not in seen:
-            seen[a["href"]] = t
-    clubs = list(seen.values())
+    v2 = _es_acta_v2(soup)
+    if v2:
+        clubs = _equips_v2(soup)
+    else:
+        seen = {}
+        for a in soup.find_all("a", href=re.compile(r"/ca/clubs/\d+/categories/\d+")):
+            t = a.get_text(strip=True)
+            if t and a["href"] not in seen:
+                seen[a["href"]] = t
+        clubs = list(seen.values())
     if len(clubs) < 2:
+        print(f" (no s'han trobat els equips a l'acta: {len(html)} bytes rebuts; la web potser ha canviat — executa prova_acta.py)", end="")
         return None, [], [], False
     # Nom canònic (el del calendari, amb la lletra A/B) per a totes les taules.
     home_team = _canon(clubs[0], canon_map)
@@ -777,7 +959,7 @@ def scrape_match_acta(acta_id: int, categoria: str, grup: int,
 
     # Resultat: de l'acta; si no s'ha pogut llegir (5 casos a les dades) el
     # del calendari. Abans quedava NaN i després es pujava/comptava com a 0-0.
-    gh, ga = _extract_score(soup)
+    gh, ga = _marcador_v2(soup) if v2 else _extract_score(soup)
     if gh is None:
         gh, ga = cal.get("goals_home"), cal.get("goals_away")
         gh = int(gh) if pd.notna(gh) else None
@@ -792,15 +974,24 @@ def scrape_match_acta(acta_id: int, categoria: str, grup: int,
             pass
 
     # --- ALINEACIONS (primer, per poder deduir l'equip dels gols) ---
-    alineacions_h = soup.find_all("h3", string="Alineacions")
-    suplents_h = soup.find_all("h3", string="Suplents")
     raw_players = []
-    for i, h in enumerate(alineacions_h[:2]):
-        team = home_team if i == 0 else away_team
-        raw_players.extend(_parse_lineup_section(h, team, "Titular"))
-    for i, h in enumerate(suplents_h[:2]):
-        team = home_team if i == 0 else away_team
-        raw_players.extend(_parse_lineup_section(h, team, "Suplent"))
+    if v2:
+        for p in _jugadors_v2(soup, home_team, away_team):
+            # el nom d'equip de l'acta (sense "A"/"B") es porta al nom canònic del calendari
+            p["team"] = _canon(p["team"], canon_map)
+            raw_players.append(p)
+        # a les alineacions v2 la pilota blava també és un gol (penal) del jugador
+        for p in raw_players:
+            p["raw_events"] = [(mi, "gol" if k in ("gol_penal",) else k) for mi, k in p["raw_events"] if k != "gol_altre"]
+    else:
+        alineacions_h = soup.find_all("h3", string="Alineacions")
+        suplents_h = soup.find_all("h3", string="Suplents")
+        for i, h in enumerate(alineacions_h[:2]):
+            team = home_team if i == 0 else away_team
+            raw_players.extend(_parse_lineup_section(h, team, "Titular"))
+        for i, h in enumerate(suplents_h[:2]):
+            team = home_team if i == 0 else away_team
+            raw_players.extend(_parse_lineup_section(h, team, "Suplent"))
 
     # nom jugador -> equip (None si el mateix nom surt als dos equips)
     team_lookup = {}
@@ -809,8 +1000,12 @@ def scrape_match_acta(acta_id: int, categoria: str, grup: int,
         team_lookup[p["player"]] = p["team"] if prev == p["team"] else None
 
     # --- GOLS (estructural, per evitar duplicats mòbil/escriptori) ---
-    events = _extract_gols(soup, home_team, away_team, match_info.get("jornada"),
-                           match_info.get("date"), team_lookup, canon_map)
+    if v2:
+        events = _gols_v2(soup, home_team, away_team, match_info.get("jornada"),
+                          match_info.get("date"), team_lookup, canon_map)
+    else:
+        events = _extract_gols(soup, home_team, away_team, match_info.get("jornada"),
+                               match_info.get("date"), team_lookup, canon_map)
 
     lineups = []
     seen_players = set()
@@ -834,10 +1029,14 @@ def scrape_match_acta(acta_id: int, categoria: str, grup: int,
         surt_mins  = [m for m, k in p["raw_events"] if k == "surt"]
         entra_mins = [m for m, k in p["raw_events"] if k == "entra"]
 
+        expulsio = vermella_mins[0] if vermella_mins else (groga_mins[1] if len(groga_mins) >= 2 else None)
+        if expulsio is not None and not isinstance(expulsio, int):
+            expulsio = None
+        fi = expulsio if expulsio is not None else 90
         if p["position"] == "Titular":
-            minutes_played = surt_mins[0] if surt_mins else 90
+            minutes_played = surt_mins[0] if surt_mins else fi
         else:
-            minutes_played = (90 - entra_mins[0]) if entra_mins else 0
+            minutes_played = max(fi - entra_mins[0], 0) if entra_mins else 0
 
         yellow_cards = 1 if n_groga >= 1 else 0
         red_cards = 1 if (n_vermella >= 1 or n_groga >= 2) else 0
@@ -1662,6 +1861,10 @@ def consolidar_tot(base_dir: Path, output_dir: Path):
 def _comprova_errors_api():
     """Si l'API de la FCF ha fallat, el procés acaba amb error (vermell a GitHub Actions i exit code 1 a Windows)
     en lloc de fer veure que tot ha anat bé: així t'assabentes el mateix dia i no dues setmanes després."""
+    if AVISOS_ACTA:
+        print(f"\n⚠️  {len(AVISOS_ACTA)} avisos del lector d'actes (icones/colors desconeguts):")
+        for a in sorted(AVISOS_ACTA)[:25]:
+            print("   -", a)
     if API_ERRORS["n"] > 0:
         print(f"\n🚨 {API_ERRORS['n']} grups no s'han pogut descarregar de la FCF. Últim error: {API_ERRORS['ultim']}")
         print("   Les dades de la web NO s'han actualitzat per a aquests grups.")
