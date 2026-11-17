@@ -187,16 +187,20 @@ def simular_categoria(grups: dict, cat: str, h=None, sigma=None, n_sims=N_SIMS):
     if cat == "PRIMERA":
         seg = at_rank(2); ter = millors(at_rank(3), 1)
         part = np.vstack([seg, ter]); marca(entra, part)
-        p = sorteig(part)
-        w1, w2 = eliminatoria(p[0], p[1]), eliminatoria(p[2], p[3])
-        marca(puja_po, eliminatoria(w1, w2))
+        if len(part) >= 4:                               # (amb menys de 3 grups no es pot fer el play-off)
+            p = sorteig(part)
+            w1, w2 = eliminatoria(p[0], p[1]), eliminatoria(p[2], p[3])
+            marca(puja_po, eliminatoria(w1, w2))
     elif cat == "SEGONA":
         for gi, g in enumerate(G):
             r2, r3, r4, r5 = (at_rank(r)[gi] for r in (2, 3, 4, 5))
             marca(entra, np.vstack([r2, r3, r4, r5]))
             marca(puja_po, eliminatoria(eliminatoria(r2, r5), eliminatoria(r3, r4)))
     else:  # TERCERA
-        seg = millors(at_rank(2), 6); ter = millors(at_rank(3), 6)
+        # Amb tots els grups (18) són 6 segons + 6 tercers. Si només hi ha alguns grups (execució parcial en
+        # local), s'usen tants candidats com grups hi hagi, en comptes de petar.
+        K = min(6, len(G))
+        seg = millors(at_rank(2), K); ter = millors(at_rank(3), K)
         marca(entra, np.vstack([seg, ter]))
         def barreja(x):
             return np.take_along_axis(x, np.argsort(rng.random(x.shape), axis=0), axis=0)
@@ -206,8 +210,10 @@ def simular_categoria(grups: dict, cat: str, h=None, sigma=None, n_sims=N_SIMS):
             if not confl.any():
                 break
             ter_p = np.where(confl[None, :], barreja(ter), ter_p)
-        guanyadors = np.vstack([eliminatoria(seg[i], ter_p[i]) for i in range(6)])
+        guanyadors = np.vstack([eliminatoria(seg[i], ter_p[i]) for i in range(K)])
         for _ in range(nrm.TERCERA_RONDES - 1):          # rondes addicionals (parelles de guanyadors)
+            if len(guanyadors) < 2:
+                break
             guanyadors = np.vstack([eliminatoria(guanyadors[2 * i], guanyadors[2 * i + 1])
                                     for i in range(len(guanyadors) // 2)])
         marca(puja_po, guanyadors)
